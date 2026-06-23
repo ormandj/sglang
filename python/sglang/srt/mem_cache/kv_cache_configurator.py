@@ -9,6 +9,9 @@ import torch
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
+from sglang.srt.utils.common import is_hip
+
+_is_hip = is_hip()
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
