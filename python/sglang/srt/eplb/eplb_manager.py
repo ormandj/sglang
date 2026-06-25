@@ -12,7 +12,6 @@ from sglang.srt.eplb.expert_location import (
     format_expert_location_layout_diff,
     get_global_expert_location_metadata,
 )
-from sglang.srt.eplb.expert_location_updater import update_expert_location_with_recovery
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
