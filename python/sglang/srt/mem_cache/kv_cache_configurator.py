@@ -58,6 +58,7 @@ class KVCacheConfigurator:
     # speculative decoding (runtime / derived, not in server_args)
     spec_algorithm: SpeculativeAlgorithm
     is_draft_worker: bool
+    post_capture_kv_active: bool
     dflash_draft_num_layers: Optional[int]
     # arch flags (derived, not direct server_args fields)
     is_hybrid_swa: bool
