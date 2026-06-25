@@ -14,6 +14,7 @@
 """Unit tests for sglang/srt/utils/weight_checker.py."""
 
 import unittest
+from types import SimpleNamespace
 from typing import Iterable, List
 from unittest.mock import patch
 
@@ -129,14 +130,18 @@ class _FakeModelRunner:
         dp_size: int = 1,
         pp_rank: int = 0,
         pp_size: int = 1,
+        attn_dp_size: int | None = None,
     ):
         self.model = model
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.dp_rank = dp_rank
-        self.dp_size = dp_size
-        self.pp_rank = pp_rank
-        self.pp_size = pp_size
+        self.ps = SimpleNamespace(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            dp_rank=dp_rank,
+            dp_size=dp_size,
+            attn_dp_size=attn_dp_size if attn_dp_size is not None else dp_size,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
+        )
 
 
 # ---------------------------------------------------------------------------
