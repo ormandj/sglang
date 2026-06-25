@@ -110,7 +110,7 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     has_forward_context,
 )
-from sglang.srt.model_executor.model_runner_components import quantization_checks
+from sglang.srt.model_executor.model_runner_components import misc_utils
 from sglang.srt.model_executor.model_runner_components.attention_backend_setup import (
     build_attention_backends,
     configure_aux_hidden_state_capture,
@@ -138,14 +138,8 @@ from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
     init_lplb_solvers,
     prepare_moe_topk,
 )
-from sglang.srt.model_executor.model_runner_components.msprobe import (
-    create_msprobe_debugger,
-)
 from sglang.srt.model_executor.model_runner_components.pool_configurator import (
     MemoryPoolConfig,
-)
-from sglang.srt.model_executor.model_runner_components.pp_proxy import (
-    resolve_pp_proxy_topk_size,
 )
 from sglang.srt.model_executor.model_runner_components.remote_instance_weight_transport import (
     RemoteInstanceWeightTransport,
@@ -416,7 +410,7 @@ class ModelRunner:
         self.init_weight_exporter()
 
     def init_msprobe(self):
-        self.msprobe_debugger = create_msprobe_debugger(self.server_args)
+        self.msprobe_debugger = misc_utils.create_msprobe_debugger(self.server_args)
 
     def init_threads_binding(self):
         self.local_omp_cpuid = numa_utils.init_threads_binding(
@@ -444,7 +438,7 @@ class ModelRunner:
         )
 
     def check_quantized_moe_compatibility(self):
-        quantization_checks.check_quantized_moe_compatibility(
+        misc_utils.check_quantized_moe_compatibility(
             model_config=self.model_config,
             tp_size=self.ps.tp_size,
             moe_ep_size=self.ps.moe_ep_size,
@@ -684,7 +678,7 @@ class ModelRunner:
         self.configure_kv_cache_dtype()
 
     def get_pp_proxy_topk_size(self) -> Optional[int]:
-        return resolve_pp_proxy_topk_size(
+        return misc_utils.resolve_pp_proxy_topk_size(
             model_config=self.model_config,
             pp_size=self.ps.pp_size,
             pp_rank=self.ps.pp_rank,
