@@ -1553,6 +1553,9 @@ class ModelRunner:
     ) -> None:
         """Commit a newly-loaded model and its provenance (post-load hook)."""
         self.model = new_model
-        self.server_args.model_path = model_path
-        self.server_args.load_format = load_format
+        self.server_args.override(
+            "model_runner.update_model_fields",
+            model_path=model_path,
+            load_format=load_format,
+        )
         self.load_config = load_config
