@@ -841,18 +841,31 @@ class KVCacheConfigurator:
         )
 
     def _dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
-        PoolCls = (
-            HiSparseDSATokenToKVPool
-            if self.server_args.enable_hisparse
-            else DSATokenToKVPool
-        )
+        from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+        (
+            dsa_cp_layer_shard_rank,
+            dsa_cp_layer_shard_size,
+        ) = get_glm_dsa_cp_layer_shard_info(self)
         pool_kwargs = {}
         if self.server_args.enable_hisparse:
+            PoolCls = HiSparseDSATokenToKVPool
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                 self.server_args
             ).host_to_device_ratio
+        elif dsa_cp_layer_shard_rank is not None:
+            # DSA cache layer split: shard KV/indexer layers across CP ranks.
+            from sglang.srt.mem_cache.dsa_cache_layer_split import (
+                LayerSplitDSATokenToKVPool,
+            )
+
+            PoolCls = LayerSplitDSATokenToKVPool
+            pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
+            pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+        else:
+            PoolCls = DSATokenToKVPool
         return PoolCls(
             max_total_num_tokens,
             page_size=self.server_args.page_size,
@@ -1373,8 +1386,10 @@ class KVCacheConfigurator:
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
-            server_args.max_mamba_cache_size = (
-                server_args.max_mamba_cache_size // self.ps.attn_dp_size
+            server_args.override(
+                "kv_cache_configurator.max_mamba_cache_size",
+                max_mamba_cache_size=server_args.max_mamba_cache_size
+                // self.ps.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -1394,8 +1409,10 @@ class KVCacheConfigurator:
             and server_args.max_running_requests is not None
         ):
             # Use explicitly set max_running_requests when radix cache is disabled
-            server_args.max_mamba_cache_size = (
-                server_args.max_running_requests // self.ps.attn_dp_size
+            server_args.override(
+                "kv_cache_configurator.max_mamba_cache_size",
+                max_mamba_cache_size=server_args.max_running_requests
+                // self.ps.attn_dp_size,
             )
             # Reserve intermediate memory based on capped max_num_reqs
             if has_spec_dec:
@@ -1426,8 +1443,11 @@ class KVCacheConfigurator:
                 ratio = self._calculate_mamba_ratio()
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // (per_req * (1 + D / ratio))
+                server_args.override(
+                    "kv_cache_configurator.max_mamba_cache_size",
+                    max_mamba_cache_size=int(
+                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                    ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
@@ -1438,7 +1458,10 @@ class KVCacheConfigurator:
                 intermediate_size = per_req * capped_reqs * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
+                server_args.override(
+                    "kv_cache_configurator.max_mamba_cache_size",
+                    max_mamba_cache_size=int(mamba_budget_bytes // per_req),
+                )
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested
