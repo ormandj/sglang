@@ -123,7 +123,7 @@ def capture_prefill_graph(
     eager_runner: EagerRunner,
     force_for_draft_worker: bool = False,
 ) -> Optional[BaseRunner]:
-    """Build the prefill CUDA graph runner (or route to eager). Returns the runner."""
+    """Initialize prefill CUDA graph runner."""
 
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
@@ -178,7 +178,6 @@ def capture_prefill_graph(
     model_runner.model.model = resolve_language_model(model_runner.model)
     language_model = getattr(model_runner.model, "language_model", model_runner.model)
 
-    # Resolve model with layers: handle CausalLM wrapper (.model.layers) and direct TextModel (.layers)
     if hasattr(language_model, "model") and hasattr(language_model.model, "layers"):
         layer_model = language_model.model
     elif hasattr(language_model, "layers"):
@@ -229,7 +228,7 @@ def capture_prefill_graph(
 
 
 def capture_decode_graph(*, model_runner: ModelRunner) -> DecodeGraphCapture:
-    """Capture device decode graphs. Returns the runner + measured graph mem."""
+    """Capture device graphs."""
     no_capture = DecodeGraphCapture(runner=None, graph_mem_usage=0)
 
     if not model_runner.is_generation:

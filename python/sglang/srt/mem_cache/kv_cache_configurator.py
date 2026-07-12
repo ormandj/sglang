@@ -106,8 +106,6 @@ if TYPE_CHECKING:
 
 
 class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
-    """Configurator output — caller writes back to ModelRunner fields."""
-
     max_total_num_tokens: int
     max_running_requests: int
     full_max_total_num_tokens: Optional[int]
@@ -119,8 +117,6 @@ class KVCacheConfigResult(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
-    """Pool sizes derived from MemoryPoolConfig + draft-worker / DSV4 rules."""
-
     max_total_num_tokens: int
     max_running_requests: int
     full_max_total_num_tokens: Optional[int]
@@ -135,46 +131,28 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class KVCacheConfigurator:
-    """KV cache pipeline (profile -> resolve -> constrain -> init pools).
-
-    Replaces ``ModelRunnerKVCacheMixin`` via composition. ``frozen=True``
-    blocks any stale ``self.X = Y`` writes left over from the mixin
-    migration; ``slots=True`` blocks attribute typos at runtime;
-    ``kw_only=True`` forces named-kwargs construction at the caller.
-
-    Pipeline intermediate state (profiled bytes / resolved configs / pool
-    objects) flows through local variables + return values, not via
-    attribute writes on ``self``.
-    """
-
-    # deployment env (runtime, not in server_args)
     device: str
     gpu_id: int
     ps: ParallelState
     pp_group: Any
-    # model / dtype (resolved objects, not in server_args)
     model_config: ModelConfig
     server_args: ServerArgs
     kv_cache_dtype: torch.dtype
     model_dtype: torch.dtype
     page_size: int
     sliding_window_size: Optional[int]
-    # speculative decoding (runtime / derived, not in server_args)
     spec_algorithm: SpeculativeAlgorithm
     is_draft_worker: bool
     post_capture_kv_active: bool
     spec_aux_config: SpecAuxHiddenStateConfig
-    # arch flags (derived, not direct server_args fields)
     is_hybrid_swa: bool
     is_hybrid_swa_compress: bool
     use_mla_backend: bool
     mambaish_config: Optional[Any]
     hybrid_gdn_config: Optional[Any]
     layer_info: ModelLayerInfo
-    # optional pre-injection (draft worker reuses target's pool)
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
-    # draft worker budget
     memory_pool_config: Optional[MemoryPoolConfig]
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
@@ -496,7 +474,6 @@ class KVCacheConfigurator:
         is_dsv4_model: bool,
         req_to_token_pool: ReqToTokenPool,
     ) -> KVCache:
-        # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
 
         # Page-granularity envelope layout for the MHA-shaped (full / SWA) pools,

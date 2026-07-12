@@ -58,7 +58,7 @@ def configure_aux_hidden_state_capture(
 def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
     server_args = model_runner.server_args
 
-    # device-specific pre-init. TODO: platform interface (separate PR).
+    # TODO: Refactor device-specific init branches into platform interface (separate PR).
     if model_runner.device in ("cuda", "musa"):
         init_cublas()
 
@@ -92,7 +92,6 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         decode_attn_backend = None
         decode_attn_backend_group = []
 
-    # device-specific post-init. TODO: platform interface (separate PR).
     if (
         model_runner.device == "npu"
         and envs.SGLANG_ZBAL_LOCAL_MEM_SIZE.get() > 0
@@ -190,8 +189,6 @@ def _build_resolved_backend(
             "The feature of hybrid attention backend is experimental and unstable. Please raise an issue if you encounter any problem."
         )
     else:
-        # Non-hybrid uses the raw server_args.attention_backend (may be "auto"),
-        # not resolved.prefill -- the two can differ under auto resolution.
         attn_backend = _build_backend_from_str(
             model_runner=model_runner,
             backend_str=model_runner.server_args.attention_backend,

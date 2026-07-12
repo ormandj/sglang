@@ -279,9 +279,7 @@ class TinyMamba2ModelConfig:
         self.is_local_attention_model = False
         self.attention_chunk_size = None
         self.sliding_window_size = None
-        # Mamba2AttnBackend reads mamba2_config(model_config).mamba_chunk_size, and the
-        # free mamba2_config() detects the config via isinstance against the real hybrid
-        # config classes, so the mock carries a real FalconH1Config holding mamba_chunk_size.
+        # Mamba2AttnBackend reads mamba2_config(model_config).mamba_chunk_size; expose it
         self.hf_config = FalconH1Config(
             architectures=["TinyMamba2ForCausalLM"],
             mamba_chunk_size=case.mamba_chunk_size,

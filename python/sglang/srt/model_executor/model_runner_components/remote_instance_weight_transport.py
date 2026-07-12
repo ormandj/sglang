@@ -30,8 +30,6 @@ class RemoteInstanceWeightTransport:
 
     @property
     def model(self) -> torch.nn.Module:
-        # Always read through the getter — ModelRunner may swap ``self.model``
-        # during weight reload, so a captured object reference would go stale.
         return self.get_model()
 
     def init_engine(self):

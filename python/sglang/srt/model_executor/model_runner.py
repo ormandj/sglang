@@ -701,10 +701,8 @@ class ModelRunner:
 
         self.init_kv_cache_configurator()
         # Unified-pool fast path: build req_to_token + token_to_kv pool + allocator
-        # from one byte buffer. Gated to the target worker (req_to_token_pool is
-        # None); supports hybrid Mamba and hybrid SWA (not DSV4). Needs
-        # ModelRunner state (forward_stream), so it cannot live on the
-        # configurator.
+        # from one byte buffer, then return. Gated to the target worker
+        # (req_to_token_pool is None); supports hybrid Mamba and hybrid SWA (not DSV4).
         if (
             self.server_args.enable_unified_memory
             and self.server_args.disaggregation_mode == "null"
@@ -724,9 +722,8 @@ class ModelRunner:
             elif self.is_hybrid_swa and not is_deepseek_v4(self.model_config.hf_config):
                 build_unified_swa_pools(self, self.max_running_requests)
             else:
-                # Fail loud, not silently fall through to the normal pools (which
-                # would leave the flag a no-op). The feature replaces the HYBRID
-                # pools only.
+                # Fail loud, not silently fall through to the normal pools (which would
+                # leave the flag a no-op). The feature replaces the HYBRID pools only.
                 raise ValueError(
                     "--enable-unified-memory only supports hybrid Mamba and "
                     "hybrid sliding-window-attention models (DeepSeek-V4 excluded); "
@@ -1555,7 +1552,6 @@ class ModelRunner:
         load_format: str,
         load_config: LoadConfig,
     ) -> None:
-        """Commit a newly-loaded model and its provenance (post-load hook)."""
         self.model = new_model
         self.server_args.override(
             "model_runner.update_model_fields",
