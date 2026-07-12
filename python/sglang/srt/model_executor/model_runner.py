@@ -138,6 +138,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+    check_quantized_moe_compatibility,
     init_lplb_solvers,
     prepare_moe_topk,
 )
@@ -432,7 +433,7 @@ class ModelRunner:
         )
 
     def check_quantized_moe_compatibility(self):
-        misc_utils.check_quantized_moe_compatibility(
+        check_quantized_moe_compatibility(
             model_config=self.model_config,
             tp_size=self.ps.tp_size,
             moe_ep_size=self.ps.moe_ep_size,
@@ -482,7 +483,13 @@ class ModelRunner:
         )
 
     def init_weight_exporter(self):
-        self.weight_exporter = WeightExporter(_model_runner=self)
+        self.weight_exporter = WeightExporter(
+            tp_rank=self.ps.tp_rank,
+            tp_size=self.ps.tp_size,
+            gpu_id=self.gpu_id,
+            model_path=self.model_config.model_path,
+            get_model=lambda: self.model,
+        )
 
     def init_remote_instance_weight_transport(self):
         self.remote_instance_weight_transport = RemoteInstanceWeightTransport(
