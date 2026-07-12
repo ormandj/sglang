@@ -7,6 +7,7 @@ import msgspec
 import torch
 
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
 from sglang.srt.runtime_context import get_parallel
@@ -54,6 +55,23 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
+    dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
+    if dtype_name in ("float32", "fp32"):
+        return torch.float32, torch.float32
+    if dtype_name in ("bfloat16", "bf16"):
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            raise ValueError(
+                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
+                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
+            )
+        return torch.bfloat16, torch.bfloat16
+    raise ValueError(
+        "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
+        f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
+    )
 
 _is_npu = is_npu()
 
