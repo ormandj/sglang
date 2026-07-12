@@ -289,6 +289,7 @@ _BYTES_PER_DST_PAGE_PADDED = math.ceil(_BYTES_PER_DST_PAGE / 576) * 576  # 37440
 def _page_split_kernel(
     src_ptr,
     dst_ptr,
+    ref_mask_ptr,
     N_pages,
     src_stride0: tl.constexpr,
     dst_stride0: tl.constexpr,
@@ -305,6 +306,9 @@ def _page_split_kernel(
     sub = pid % RATIO
 
     if page_idx >= N_pages:
+        return
+    # Only copy source pages referenced by this step's sparse indices.
+    if tl.load(ref_mask_ptr + page_idx) == 0:
         return
 
     src_base = src_ptr + page_idx * src_stride0
@@ -327,7 +331,9 @@ def _page_split_kernel(
         tl.store(dst_base + DST_SCALE_OFF + offs, vals, mask=mask)
 
 
-def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
+def _split_kv_pages_to_64(
+    kv_u8: torch.Tensor, src_pbs: int, ref_mask: torch.Tensor
+) -> torch.Tensor:
     """Split pbs=N footer-format pages into pbs=64 footer-format pages.
 
     Uses a fused Triton kernel to do all sub-page copies in a single launch
@@ -370,6 +376,7 @@ def _split_kv_pages_to_64(kv_u8: torch.Tensor, src_pbs: int) -> torch.Tensor:
     _page_split_kernel[grid](
         src_2d,
         out,
+        ref_mask,
         N,
         src_stride0,
         _BYTES_PER_DST_PAGE_PADDED,
@@ -400,14 +407,19 @@ def _flash_mla_flashinfer(
     extra_indices,
     extra_topk_length,
 ):
-    """FlashInfer SM120 sparse MLA via sparse_mla_sm120_decode_dsv4.
+    """FlashInfer SM120 sparse MLA via the paged-attention dispatcher.
 
     SGLang SWA pool uses page_size=256 (footer format: 256*576 bytes data + 256*8 bytes scale).
     FlashInfer decode_dsv4 fast path requires page_block_size=64 (footer: 64*576 + 64*8).
     We split 256-token pages into 4 virtual 64-token pages.
     Token indices are invariant under page-split (identity mapping).
     """
-    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _DECODE_MAX_TOKENS as _FI_DECODE_MAX_TOKENS,
+    )
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _sparse_mla_sm120_paged_attention,
+    )
 
     B, _, H, D = q.shape  # (batch, 1, num_heads, head_dim)
     dev = q.device
@@ -415,7 +427,29 @@ def _flash_mla_flashinfer(
     # --- Page-split: convert pbs=N kv_cache to pbs=64 view ---
     kv_u8 = k_cache.view(torch.uint8) if k_cache.dtype != torch.uint8 else k_cache
     src_pbs = k_cache.shape[1] if k_cache.ndim >= 3 else _PBS_SRC
-    kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs) if src_pbs != _PBS_DST else kv_u8
+    idx = indices.squeeze(1) if indices.dim() == 3 else indices
+    if src_pbs != _PBS_DST:
+        N_src = kv_u8.shape[0]
+        from sglang.srt.runtime_context import get_resources
+
+        buffers = get_resources().buffers
+        key = f"flash_mla_sm120_ref_mask:{kv_u8.device}"
+        rmask = buffers.get(key)
+        if rmask is None or rmask.shape[0] < N_src:
+            # This buffer is mutated across calls. Allocate a normal tensor even
+            # when the first call occurs under torch.inference_mode().
+            with torch.inference_mode(False):
+                rmask = torch.zeros(N_src, dtype=torch.uint8, device=kv_u8.device)
+            buffers[key] = rmask
+        rmask = rmask[:N_src]
+        rmask.zero_()
+        ref_pages = torch.clamp(
+            idx.reshape(-1) // src_pbs, min=0, max=N_src - 1
+        ).to(torch.long)
+        rmask.index_fill_(0, ref_pages, 1)
+        kv_64 = _split_kv_pages_to_64(kv_u8, src_pbs, rmask)
+    else:
+        kv_64 = kv_u8
 
     extra_kv_u8 = (
         extra_k_cache.view(torch.uint8)
@@ -425,7 +459,6 @@ def _flash_mla_flashinfer(
     extra_kv_64 = extra_kv_u8
 
     # Indices: no remapping needed (page-split preserves token addressing).
-    idx = indices.squeeze(1) if indices.dim() == 3 else indices
     extra_idx = (
         extra_indices.squeeze(1)
         if extra_indices is not None and extra_indices.dim() == 3
@@ -435,32 +468,37 @@ def _flash_mla_flashinfer(
     output = torch.empty(B, H, head_dim_v, dtype=torch.bfloat16, device=dev)
     out_lse = torch.empty(B, H, dtype=torch.float32, device=dev)
 
-    # Pre-allocate split-K scratch for decode-dsv4 fast path.
-    topk = idx.shape[-1]
-    extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
-    _BI = 64
-    num_splits = (topk + _BI - 1) // _BI + (
-        (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
-    )
-    mid_out = torch.empty(
-        B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=dev
-    )
-    mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
+    # Use split-K for decode-sized batches and paged attention otherwise.
+    if B <= _FI_DECODE_MAX_TOKENS:
+        topk = idx.shape[-1]
+        extra_topk = extra_idx.shape[-1] if extra_idx is not None else 0
+        _BI = 64
+        num_splits = (topk + _BI - 1) // _BI + (
+            (extra_topk + _BI - 1) // _BI if extra_topk > 0 else 0
+        )
+        mid_out = torch.empty(
+            B, H, num_splits, head_dim_v, dtype=torch.bfloat16, device=dev
+        )
+        mid_lse = torch.empty(B, H, num_splits, dtype=torch.float32, device=dev)
+    else:
+        mid_out = None
+        mid_lse = None
 
-    sparse_mla_sm120_decode_dsv4(
-        q=q.squeeze(1) if q.ndim == 4 else q,
-        kv_cache=kv_64,
-        indices=idx,
-        mid_out=mid_out,
-        mid_lse=mid_lse,
-        output=output,
-        out_lse=out_lse,
-        sm_scale=softmax_scale,
+    _sparse_mla_sm120_paged_attention(
+        q.squeeze(1) if q.ndim == 4 else q,
+        kv_64,
+        idx,
+        output,
+        out_lse,
+        softmax_scale,
+        d_v=head_dim_v,
         topk_length=topk_length,
         attn_sink=attn_sink,
         extra_kv_cache=extra_kv_64,
         extra_indices=extra_idx,
         extra_topk_length=extra_topk_length,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
     )
 
     return (output.unsqueeze(1), None)
