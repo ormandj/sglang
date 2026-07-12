@@ -164,34 +164,18 @@ class KVCacheConfigurator:
     is_draft_worker: bool
     post_capture_kv_active: bool
     spec_aux_config: SpecAuxHiddenStateConfig
-    dflash_draft_num_layers: Optional[int]
     # arch flags (derived, not direct server_args fields)
     is_hybrid_swa: bool
     is_hybrid_swa_compress: bool
     use_mla_backend: bool
     mambaish_config: Optional[Any]
     hybrid_gdn_config: Optional[Any]
-    # PP slice
-    start_layer: int
-    end_layer: int
-    num_effective_layers: int
+    layer_info: ModelLayerInfo
     # optional pre-injection (draft worker reuses target's pool)
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     # draft worker budget
     memory_pool_config: Optional[MemoryPoolConfig]
-
-    @property
-    def layer_info(self) -> ModelLayerInfo:
-        from sglang.srt.model_executor.model_runner_components.layer_setup import (
-            ModelLayerInfo,
-        )
-
-        return ModelLayerInfo(
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
-            num_effective_layers=self.num_effective_layers,
-        )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
@@ -420,7 +404,7 @@ class KVCacheConfigurator:
                 [
                     i
                     for i in self.mambaish_config.mamba2_cache_params.layers
-                    if self.start_layer <= i < self.end_layer
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
                 ]
             ),
             speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
@@ -429,7 +413,7 @@ class KVCacheConfigurator:
             pre_alloc_size=pre_alloc_size,
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
             mamba_size=self.server_args.max_mamba_cache_size,
-            start_layer=self.start_layer,
+            start_layer=self.layer_info.start_layer,
         )
 
     def _decode_req_pool(
@@ -467,7 +451,7 @@ class KVCacheConfigurator:
                 [
                     i
                     for i in self.mambaish_config.mamba2_cache_params.layers
-                    if self.start_layer <= i < self.end_layer
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
                 ]
             ),
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
@@ -475,7 +459,7 @@ class KVCacheConfigurator:
             speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
             speculative_eagle_topk=self.server_args.speculative_eagle_topk,
             enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
-            start_layer=self.start_layer,
+            start_layer=self.layer_info.start_layer,
             enable_linear_replayssm=self.server_args.enable_linear_replayssm,
             linear_replayssm_cache_len=self.server_args.linear_replayssm_cache_len,
             mamba_envelope_layout=self.server_args.enable_page_major_kv_layout,
@@ -637,7 +621,7 @@ class KVCacheConfigurator:
 
             compression_ratios = [
                 COMPRESS_RATIO_NEXTN_LAYER
-            ] * self.num_effective_layers
+            ] * self.layer_info.num_effective_layers
         else:
             compression_ratios = self.model_config.compress_ratios
 
@@ -692,12 +676,12 @@ class KVCacheConfigurator:
             qk_nope_head_dim=self.model_config.qk_nope_head_dim,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             indexer_head_dim=self.model_config.index_head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
             compression_ratios=compression_ratios,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
             enable_hisparse=self.server_args.enable_hisparse,
             online_mtp_max_draft_tokens=(
                 self.server_args.max_speculative_num_draft_tokens or 0
@@ -714,7 +698,7 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
@@ -722,8 +706,8 @@ class KVCacheConfigurator:
                 server_args=self.server_args,
             ),
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
         )
 
@@ -740,11 +724,11 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
         )
 
     def _oot_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -757,11 +741,11 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
         )
 
     def _ascend_swa_kv_pool(
@@ -815,11 +799,11 @@ class KVCacheConfigurator:
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
         )
 
     def _ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -833,11 +817,11 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
         )
 
     def _dsa_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -872,7 +856,7 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             kv_cache_dim=calculate_mla_kv_cache_dim(
                 model_config=self.model_config,
@@ -880,8 +864,8 @@ class KVCacheConfigurator:
                 server_args=self.server_args,
             ),
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
             index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
             **pool_kwargs,
         )
@@ -893,11 +877,11 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
         )
 
     def _mla_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
@@ -907,11 +891,11 @@ class KVCacheConfigurator:
             dtype=self.kv_cache_dtype,
             kv_lora_rank=self.model_config.kv_lora_rank,
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
         )
 
     def _hybrid_swa_kv_pool(
@@ -968,8 +952,8 @@ class KVCacheConfigurator:
             disable_value_sparse_layer_ids=disable_value_sparse_layer_ids,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
         )
 
     def _hybrid_linear_kv_pool(
@@ -998,7 +982,7 @@ class KVCacheConfigurator:
                 else [
                     i
                     for i in self.mambaish_config.full_attention_layer_ids
-                    if self.start_layer <= i < self.end_layer
+                    if self.layer_info.start_layer <= i < self.layer_info.end_layer
                 ]
             ),
             device=self.device,
@@ -1006,7 +990,7 @@ class KVCacheConfigurator:
             enable_memory_saver=self.server_args.enable_memory_saver,
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
             use_mla=self.use_mla_backend,
-            start_layer=self.start_layer,
+            start_layer=self.layer_info.start_layer,
             full_kv_pool_class=mha_pool_class,
             post_capture_active=self.post_capture_kv_active,
             **extra_args,
@@ -1020,11 +1004,11 @@ class KVCacheConfigurator:
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
             enable_alt_stream=not self.server_args.enable_pdmux,
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
         )
@@ -1044,11 +1028,11 @@ class KVCacheConfigurator:
             head_num=self.model_config.get_num_kv_heads(get_parallel().attn_tp_size),
             head_dim=self.model_config.head_dim,
             v_head_dim=self.model_config.v_head_dim,
-            layer_num=self.num_effective_layers,
+            layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=self.server_args.enable_memory_saver,
-            start_layer=self.start_layer,
-            end_layer=self.end_layer,
+            start_layer=self.layer_info.start_layer,
+            end_layer=self.layer_info.end_layer,
             enable_alt_stream=not self.server_args.enable_pdmux,
             enable_kv_cache_copy=(self.server_args.speculative_algorithm is not None),
             post_capture_active=self.post_capture_kv_active,

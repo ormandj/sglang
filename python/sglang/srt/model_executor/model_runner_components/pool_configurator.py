@@ -230,10 +230,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             )
 
             local_dense_layer_ids = [
-                l for l in dense_layer_ids if kvc.start_layer <= l < kvc.end_layer
+                l
+                for l in dense_layer_ids
+                if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
             ]
             local_sparse_layer_ids = [
-                l for l in sparse_layer_ids if kvc.start_layer <= l < kvc.end_layer
+                l
+                for l in sparse_layer_ids
+                if kvc.layer_info.start_layer <= l < kvc.layer_info.end_layer
             ]
             num_dense = len(local_dense_layer_ids)
             num_sparse = len(local_sparse_layer_ids)
