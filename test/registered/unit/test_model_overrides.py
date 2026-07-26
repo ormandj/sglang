@@ -86,6 +86,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
+                    "enable_flashinfer_allreduce_only",
                     "fp8_gemm_runner_backend",
                     "disable_custom_all_reduce",
                     "enable_aiter_allreduce_fusion",
@@ -1112,7 +1113,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     enforce_disable_flashinfer_allreduce_fusion=True,
                 )
             ),
-            {"flashinfer_allreduce_fusion_backend": None},
+            {
+                "flashinfer_allreduce_fusion_backend": None,
+                "enable_flashinfer_allreduce_only": False,
+            },
         )
         self.assertEqual(_enforce_disable_allreduce_fusion(_view()), {})
 
