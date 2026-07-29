@@ -838,6 +838,39 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with patch.object(overrides_module, "is_sm120_supported", return_value=False):
             self.assertEqual(_deepseek_v4_sm120_moe(_view()), {})
 
+    def test_sm120_fp8_wo_a_gemm_default_keeps_explicit_setting(self):
+        """The SM120 FP8 W_o_A GEMM knob is a default, not a force.
+
+        SM120 turns the GEMM off out of the box, but an explicit
+        SGLANG_OPT_FP8_WO_A_GEMM is the user's call and must reach the later
+        DeepGEMM capability check unchanged -- that check is what disables an
+        opt-in the installed DeepGEMM cannot honor.
+        """
+        from sglang.srt.environ import envs
+        from sglang.srt.server_args import _apply_sm120_fp8_wo_a_gemm_default
+
+        field = envs.SGLANG_OPT_FP8_WO_A_GEMM
+
+        # Unset: defaulted off. `override` then `clear` leaves the var unset
+        # inside the block and restores the caller's environment on exit.
+        with field.override(True):
+            field.clear()
+            _apply_sm120_fp8_wo_a_gemm_default()
+            self.assertFalse(field.get())
+
+        # Explicit opt-in survives (the default is True, so a clobber would
+        # still read True here -- assert it stays explicitly set).
+        with field.override(True):
+            _apply_sm120_fp8_wo_a_gemm_default()
+            self.assertTrue(field.get())
+            self.assertTrue(field.is_set())
+
+        # Explicit opt-out survives.
+        with field.override(False):
+            _apply_sm120_fp8_wo_a_gemm_default()
+            self.assertFalse(field.get())
+            self.assertTrue(field.is_set())
+
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _nemotron_h_overrides
 

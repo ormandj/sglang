@@ -409,6 +409,20 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+def _apply_sm120_fp8_wo_a_gemm_default() -> None:
+    """Default the FP8 W_o_A GEMM off on SM120, without overriding the user.
+
+    SM120 has no tcgen05/TMEM, so a stock DeepGEMM cannot run this GEMM and off
+    is the right out-of-the-box choice. An explicit SGLANG_OPT_FP8_WO_A_GEMM is
+    a user decision and is left alone, so a DeepGEMM build with SM120 support
+    can opt back in. The capability check in `_handle_environment_variables`
+    stays authoritative: it still turns an explicit opt-in off when the
+    installed DeepGEMM lacks the capability.
+    """
+    if not envs.SGLANG_OPT_FP8_WO_A_GEMM.is_set():
+        envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -5185,7 +5199,7 @@ class ServerArgs:
             if is_sm120_supported():
                 # SM120 lacks tcgen05/TMEM: disable features that depend on
                 # DeepGEMM or require >99KB SMEM (topk_v2).
-                envs.SGLANG_OPT_FP8_WO_A_GEMM.set(False)
+                _apply_sm120_fp8_wo_a_gemm_default()
                 envs.SGLANG_OPT_USE_TOPK_V2.set(False)
                 if not envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.is_set():
                     envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
