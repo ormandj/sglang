@@ -25,6 +25,13 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
+# TODO: According to the discussion in https://github.com/flashinfer-ai/flashinfer/issues/1223#issuecomment-3047256465
+# We set the max token num to 128 for allreduce fusion with min-latency case(use_oneshot=True).
+# Bounds both entry points: the allreduce-only kAllReduce path is the same
+# min-latency kernel, so it takes the same token bound. Defined here rather than
+# in communicator.py because that module already imports from this one.
+FUSE_ALLREDUCE_MAX_BATCH_SIZE = 2048
+
 # FlashInfer allreduce fusion: set when flashinfer is available (see block below)
 _flashinfer_comm = None
 _TorchDistBackend = None
@@ -908,6 +915,11 @@ def can_use_flashinfer_allreduce(
     # Dynamo, so statically-off configs must short-circuit before reaching them
     # (same ordering rule as apply_flashinfer_allreduce_fusion).
     token_num, hidden_dim = input_.shape
+    # Without this the only ceiling is the workspace allocation, so a deployment
+    # that sizes its workspace for the prefill forward sends prefill-sized
+    # all-reduces here instead of to the NCCL ring.
+    if token_num > FUSE_ALLREDUCE_MAX_BATCH_SIZE:
+        return False
     if torch.compiler.is_compiling():
         # Don't call into the flashinfer workspace object while tracing. The
         # workspace was allocated for (max_token_num, hidden_dim, dtype) and

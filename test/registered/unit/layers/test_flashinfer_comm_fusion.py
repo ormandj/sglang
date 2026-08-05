@@ -372,6 +372,20 @@ class TestFlashInferAllReduceOnly(CustomTestCase):
                 self.assertTrue(self._can_use(torch.randn(8, 16)))
                 self.assertFalse(self._can_use(torch.randn(9, 16)))
 
+    def test_rejects_prefill_sized_batches_even_when_workspace_fits(self):
+        """kAllReduce takes the same token bound as the fused path.
+
+        _FakeWorkspace.is_buffer_size_sufficient() always returns True, so a
+        workspace sized for the prefill forward would otherwise qualify here.
+        """
+        manager = self._make_manager(4)
+        manager.max_token_num = 8192
+        cap = fusion.FUSE_ALLREDUCE_MAX_BATCH_SIZE
+        with self._patched_attn_workspace(manager):
+            self.assertTrue(self._can_use(torch.randn(cap, 4096)))
+            self.assertFalse(self._can_use(torch.randn(cap + 1, 4096)))
+            self.assertFalse(self._can_use(torch.randn(8192, 4096)))
+
     def test_rejects_when_hidden_dim_exceeds_workspace_capacity(self):
         manager = self._make_manager(4)
         manager.hidden_dim = 16
