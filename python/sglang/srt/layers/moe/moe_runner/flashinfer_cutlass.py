@@ -47,6 +47,8 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
       - ``"bf16"``: unquantized weights, BF16/FP16 input, no quant scales.
       - ``"fp8"``: FP8 weights, FP8-quantized input, per-tensor scales.
       - ``"fp4"``: NVFP4 packed weights and optional NVFP4 packed input.
+      - ``"w4a16_e4m3_k32"``: SM12x E2M1 weights with E4M3 K/32 scales
+        and BF16 activations through FlashInfer's b12x W4A16 kernels.
     """
 
     quant_type: str
@@ -59,6 +61,63 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+
+
+def _run_flashinfer_b12x_w4a16(
+    *,
+    dispatch_output,
+    quant_info: FlashInferCutlassMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+    output: Optional[torch.Tensor],
+    enable_alltoall: bool,
+) -> torch.Tensor:
+    if enable_alltoall:
+        raise NotImplementedError(
+            "FlashInfer b12x W4A16 currently supports TP without expert "
+            "all-to-all; use TP2/EP1."
+        )
+    if quant_info.moe_ep_size != 1:
+        raise NotImplementedError("FlashInfer b12x W4A16 requires EP size 1.")
+    if runner_config.activation != "silu" or not runner_config.is_gated:
+        raise NotImplementedError(
+            "The GLM b12x W4A16 path currently requires gated SiLU."
+        )
+    assert quant_info.quant_scales is not None and len(quant_info.quant_scales) == 4
+    if runner_config.num_experts is None or runner_config.top_k is None:
+        raise ValueError("b12x W4A16 requires num_experts and top_k in runner config")
+
+    x = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    if output is None:
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            output = torch.empty_like(x, dtype=torch.bfloat16)
+
+    from flashinfer.fused_moe.cute_dsl.b12x_moe import b12x_fused_moe
+
+    w13_scale, w13_global_scale, w2_scale, w2_global_scale = (
+        quant_info.quant_scales
+    )
+    return b12x_fused_moe(
+        x=x,
+        w1_weight=quant_info.w13_weight,
+        w1_weight_sf=w13_scale,
+        w1_alpha=w13_global_scale,
+        w2_weight=quant_info.w2_weight,
+        w2_weight_sf=w2_scale,
+        w2_alpha=w2_global_scale,
+        token_selected_experts=topk_output.topk_ids.to(torch.int),
+        token_final_scales=topk_output.topk_weights,
+        num_experts=runner_config.num_experts,
+        num_local_experts=runner_config.num_local_experts,
+        top_k=runner_config.top_k,
+        output=output,
+        output_dtype=torch.bfloat16,
+        activation="silu",
+        quant_mode="w4a16",
+        source_format="modelopt_e4m3_k32",
+    )
 
 
 @dataclass
@@ -187,6 +246,15 @@ def _run_flashinfer_cutlass(
     output: Optional[torch.Tensor] = None,
     enable_alltoall: bool = False,
 ) -> torch.Tensor:
+    if quant_info.quant_type == "w4a16_e4m3_k32":
+        return _run_flashinfer_b12x_w4a16(
+            dispatch_output=dispatch_output,
+            quant_info=quant_info,
+            runner_config=runner_config,
+            output=output,
+            enable_alltoall=enable_alltoall,
+        )
+
     flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
     topk_output = dispatch_output.topk_output
