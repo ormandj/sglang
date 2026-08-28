@@ -2216,6 +2216,15 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         return get_moe_runner_backend().is_flashinfer_cutlass()
 
     @property
+    def _use_flashinfer_b12x_w4a16(self) -> bool:
+        """Use the SM12x BF16-activation kernel for the E4M3 K/32 contract."""
+        return (
+            self.enable_flashinfer_cutlass_moe
+            and getattr(self.quant_config, "is_w4a16", False)
+            and self.quant_config.group_size == 32
+        )
+
+    @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
         """Access the global enable_flashinfer_cutedsl_moe setting."""
         from sglang.srt.layers.moe import get_moe_runner_backend
@@ -2328,7 +2337,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
         # during process_weights_after_loading, so skip the expensive
         # swizzle+allocate here to avoid GPU memory fragmentation
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or self._use_flashinfer_b12x_w4a16:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2348,7 +2357,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if self.enable_flashinfer_trtllm_moe:
+        if self.enable_flashinfer_trtllm_moe or self._use_flashinfer_b12x_w4a16:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
@@ -2424,7 +2433,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if getattr(layer, "inference_moe_w13_interleaved", False) and not getattr(
             layer, "_w13_deinterleaved", False
         ):
-            up_first = self.enable_flashinfer_trtllm_moe
+            up_first = (
+                self.enable_flashinfer_trtllm_moe
+                or self._use_flashinfer_b12x_w4a16
+            )
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
             )
@@ -2567,8 +2579,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 copy_or_rebind_param(layer, "gemm1_beta", gemm1_beta)
 
         # TODO: for flashinfer always do MOE_NVFP4_DISPATCH
-        use_dispatch_fp4 = not self.quant_config.use_per_token_activation and (
-            MOE_NVFP4_DISPATCH or should_use_flashinfer_cutlass_moe_fp4_allgather()
+        use_dispatch_fp4 = (
+            not self._use_flashinfer_b12x_w4a16
+            and not self.quant_config.use_per_token_activation
+            and (
+                MOE_NVFP4_DISPATCH
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+            )
         )
 
         layer.dispatcher.set_quant_config(
@@ -2607,7 +2624,27 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ), f"{name} Weight Blockscale must be represented as FP8-E4M3"
 
         # Weight processing based on strategy
-        if (
+        if self._use_flashinfer_b12x_w4a16:
+            expected_blocks = {
+                "w13": layer.w13_weight.shape[2] * 2 // 32,
+                "w2": layer.w2_weight.shape[2] * 2 // 32,
+            }
+            if layer.w13_weight_scale.shape[-1] != expected_blocks["w13"]:
+                raise ValueError(
+                    "E4M3 K/32 w13 scale shape does not match packed weights: "
+                    f"{tuple(layer.w13_weight_scale.shape)}"
+                )
+            if layer.w2_weight_scale.shape[-1] != expected_blocks["w2"]:
+                raise ValueError(
+                    "E4M3 K/32 w2 scale shape does not match packed weights: "
+                    f"{tuple(layer.w2_weight_scale.shape)}"
+                )
+            # FlashInfer's b12x preparer consumes logical [E, N, K/32] scales.
+            # Keep them unswizzled and alias the legacy field names so no
+            # second scale allocation survives model loading.
+            layer.w13_blockscale_swizzled = layer.w13_weight_scale
+            layer.w2_blockscale_swizzled = layer.w2_weight_scale
+        elif (
             self.enable_flashinfer_trtllm_moe
             and reorder_rows_for_gated_act_gemm is not None
             and shuffle_matrix_sf_a is not None
@@ -2932,18 +2969,31 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 not moe_runner_config.apply_router_weight_on_input
             ), "apply_router_weight_on_input is not supported for Flashinfer"
             quant_info = FlashInferCutlassMoeQuantInfo(
-                quant_type="fp4",
+                quant_type=(
+                    "w4a16_e4m3_k32"
+                    if self._use_flashinfer_b12x_w4a16
+                    else "fp4"
+                ),
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 output_dtype=torch.bfloat16,
-                quant_scales=[
-                    layer.w13_input_scale_quant,
-                    layer.w13_blockscale_swizzled,
-                    layer.g1_alphas,
-                    layer.w2_input_scale_quant,
-                    layer.w2_blockscale_swizzled,
-                    layer.g2_alphas,
-                ],
+                quant_scales=(
+                    [
+                        layer.w13_blockscale_swizzled,
+                        layer.g1_alphas,
+                        layer.w2_blockscale_swizzled,
+                        layer.g2_alphas,
+                    ]
+                    if self._use_flashinfer_b12x_w4a16
+                    else [
+                        layer.w13_input_scale_quant,
+                        layer.w13_blockscale_swizzled,
+                        layer.g1_alphas,
+                        layer.w2_input_scale_quant,
+                        layer.w2_blockscale_swizzled,
+                        layer.g2_alphas,
+                    ]
+                ),
                 moe_ep_size=layer.moe_ep_size,
                 moe_ep_rank=layer.moe_ep_rank,
                 moe_tp_size=layer.moe_tp_size,
