@@ -78,6 +78,17 @@ def _cuda_sm_count() -> int:
     ).multi_processor_count
 
 
+@lru_cache(maxsize=1)
+def _cuda_sparse_attention_num_stages() -> int:
+    """Fit the v1 BF16 sparse kernel to the device's dynamic-SMEM limit."""
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    # The default two-stage v1 schedule needs 169,984 B for GLM's NoPE
+    # geometry. SM120/SM121 expose about 99 KiB per block; one stage needs
+    # about 86 KiB and is the independently validated consumer-Blackwell
+    # schedule. Datacenter Blackwell/Hopper retain the two-stage default.
+    return 1 if props.shared_memory_per_block_optin < 120 * 1024 else 2
+
+
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """
@@ -1431,9 +1442,13 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, return_lse=return_lse
-        )
+        kernel_kwargs = {
+            "sm_scale": sm_scale,
+            "return_lse": return_lse,
+        }
+        if tail_dim == 0:
+            kernel_kwargs["num_stages"] = _cuda_sparse_attention_num_stages()
+        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, **kernel_kwargs)
         # Caller-allocated LSE (in-place kernel arg): written only by kernels
         # traced with return_lse=True, but the prim_func signature always has it.
         lse = torch.empty(

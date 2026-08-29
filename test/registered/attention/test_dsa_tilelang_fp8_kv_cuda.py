@@ -78,6 +78,19 @@ def test_fp8_one_hot_exact():
 
 
 @requires_fp8_cuda
+def test_bf16_one_hot_exact_uses_device_smem_schedule():
+    q, kv, _ = _make_inputs(2)
+    idx_hot = torch.full((S, 1, TOPK), -1, device="cuda", dtype=torch.int32)
+    hot = torch.randint(1, POOL, (S,), device="cuda")
+    idx_hot[:, 0, 0] = hot.to(torch.int32)
+    out = tilelang_kernel.tilelang_sparse_fwd(q, kv, idx_hot, SM_SCALE, d_v=DV)
+    torch.cuda.synchronize()
+    expect = kv.float().squeeze(1)[hot.long()].unsqueeze(1).expand(S, H, DV)
+    rel = _rel_err(out.reshape(S, H, DV), expect)
+    assert rel < 1e-3, f"bf16 one-hot rel err {rel:.6f} exceeds 1e-3"
+
+
+@requires_fp8_cuda
 def test_fp8_spread_within_budget_and_negative_control_fails():
     q, kv, idx = _make_inputs(1)
     kv_fp8 = kv.to(torch.float8_e4m3fn)
