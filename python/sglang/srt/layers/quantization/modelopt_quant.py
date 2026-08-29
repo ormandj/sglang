@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -162,6 +163,76 @@ if is_cuda() and (not is_sm120_supported()) and (fp4_quantize is not None):
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
 FP4_GEMM_ALIGNMENT = 32
+
+
+def _reuse_b12x_scale_storage(
+    source: torch.Tensor, packed: torch.Tensor, *, name: str
+) -> torch.Tensor:
+    """Move a prepared scale layout into its byte-identical source storage."""
+    if not source.is_contiguous():
+        raise ValueError(f"{name} source scale storage must be contiguous")
+    if source.device != packed.device:
+        raise ValueError(
+            f"{name} source and prepared scales must share a device: "
+            f"{source.device} != {packed.device}"
+        )
+    if source.nbytes != packed.nbytes:
+        raise ValueError(
+            f"{name} prepared scale layout changed storage size: "
+            f"{source.nbytes} != {packed.nbytes} bytes"
+        )
+
+    with torch.no_grad():
+        source.view(torch.uint8).reshape(-1).copy_(
+            packed.contiguous().view(torch.uint8).reshape(-1)
+        )
+    return source.view(packed.dtype).reshape(packed.shape)
+
+
+def _prepare_flashinfer_b12x_w4a16_inplace(layer: torch.nn.Module):
+    """Prepare SM12x W4A16 weights without retaining a checkpoint-layout copy.
+
+    FlashInfer's functional b12x API lazily caches one second packed weight and
+    scale set per MoE layer. That is tolerable for small models but exceeds the
+    remaining HBM for GLM-5.3-Flash. Its preparer already supports tiling the
+    FP4 weights into their byte-identical source storage. Reuse that storage,
+    copy the equally-sized prepared K/32 scales back over their source buffers,
+    and retain only the prepared views for the lifetime of the layer.
+    """
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
+        prepare_w4a16_packed_weights,
+    )
+
+    prepared = prepare_w4a16_packed_weights(
+        layer.w13_weight,
+        layer.w13_blockscale_swizzled,
+        layer.g1_alphas,
+        layer.w2_weight,
+        layer.w2_blockscale_swizzled,
+        layer.g2_alphas,
+        activation="silu",
+        params_dtype=layer.params_dtype,
+        source_format="modelopt_e4m3_k32",
+        w13_layout="w13",
+        reuse_input_storage=True,
+    )
+
+    if prepared.w13.data_ptr() != layer.w13_weight.data_ptr():
+        raise RuntimeError("FlashInfer W13 preparation did not reuse source storage")
+    if prepared.w2.data_ptr() != layer.w2_weight.data_ptr():
+        raise RuntimeError("FlashInfer W2 preparation did not reuse source storage")
+
+    w13_scale = _reuse_b12x_scale_storage(
+        layer.w13_blockscale_swizzled,
+        prepared.w13_scale,
+        name="W13",
+    )
+    w2_scale = _reuse_b12x_scale_storage(
+        layer.w2_blockscale_swizzled,
+        prepared.w2_scale,
+        name="W2",
+    )
+    return replace(prepared, w13_scale=w13_scale, w2_scale=w2_scale)
 
 
 def round_up_to_multiple(x: int, m: int) -> int:
@@ -2640,10 +2711,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     f"{tuple(layer.w2_weight_scale.shape)}"
                 )
             # FlashInfer's b12x preparer consumes logical [E, N, K/32] scales.
-            # Keep them unswizzled and alias the legacy field names so no
-            # second scale allocation survives model loading.
+            # Keep them unswizzled and alias the legacy field names before the
+            # one-time in-place b12x preparation below.
             layer.w13_blockscale_swizzled = layer.w13_weight_scale
             layer.w2_blockscale_swizzled = layer.w2_weight_scale
+            layer._flashinfer_b12x_w4a16_prepared_weights = (
+                _prepare_flashinfer_b12x_w4a16_inplace(layer)
+            )
         elif (
             self.enable_flashinfer_trtllm_moe
             and reorder_rows_for_gated_act_gemm is not None
@@ -2999,6 +3073,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 moe_tp_size=layer.moe_tp_size,
                 moe_tp_rank=layer.moe_tp_rank,
                 apply_routed_scaling_factor=False,
+                prepared_weights=(
+                    layer._flashinfer_b12x_w4a16_prepared_weights
+                    if self._use_flashinfer_b12x_w4a16
+                    else None
+                ),
             )
             return self.runner.run(dispatch_output, quant_info)
 

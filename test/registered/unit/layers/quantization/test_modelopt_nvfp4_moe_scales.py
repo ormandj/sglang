@@ -29,7 +29,10 @@ import torch
 # schemes package; the quantization-package-first order masks it. The isort
 # guards keep that order.
 # isort: off
-from sglang.srt.layers.quantization.modelopt_quant import _compute_gemm1_alphas
+from sglang.srt.layers.quantization.modelopt_quant import (
+    _compute_gemm1_alphas,
+    _reuse_b12x_scale_storage,
+)
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import _compute_g1_scale_c
 
 # isort: on
@@ -47,6 +50,36 @@ REAL_MOE_CONFIGS = [
 ]
 GATED_CONFIGS = [c for c in REAL_MOE_CONFIGS if c[-1]]
 NONGATED_CONFIG = next(c for c in REAL_MOE_CONFIGS if not c[-1])
+
+
+class TestB12xScaleStorageReuse(CustomTestCase):
+    def test_prepared_layout_reuses_source_bytes(self):
+        source = torch.zeros((2, 4, 8), dtype=torch.uint8)
+        packed = torch.arange(64, dtype=torch.uint8).reshape(2, 8, 4)
+        source_ptr = source.data_ptr()
+
+        prepared_view = _reuse_b12x_scale_storage(source, packed, name="test")
+
+        self.assertEqual(prepared_view.data_ptr(), source_ptr)
+        self.assertEqual(tuple(prepared_view.shape), tuple(packed.shape))
+        torch.testing.assert_close(prepared_view, packed)
+
+    def test_rejects_storage_size_change(self):
+        with self.assertRaisesRegex(ValueError, "changed storage size"):
+            _reuse_b12x_scale_storage(
+                torch.zeros(8, dtype=torch.uint8),
+                torch.zeros(9, dtype=torch.uint8),
+                name="test",
+            )
+
+    def test_rejects_noncontiguous_source(self):
+        source = torch.zeros((4, 4), dtype=torch.uint8).T
+        with self.assertRaisesRegex(ValueError, "must be contiguous"):
+            _reuse_b12x_scale_storage(
+                source,
+                torch.zeros((4, 4), dtype=torch.uint8),
+                name="test",
+            )
 
 
 def _global_scales(num_experts: int, num_cols: int, seed: int) -> torch.Tensor:
