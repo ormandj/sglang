@@ -9,7 +9,7 @@ Quantization methods prepare a small quant_info payload and route through
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -61,6 +61,7 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     moe_ep_size: int = 1
     moe_ep_rank: int = 0
     apply_routed_scaling_factor: bool = True
+    prepared_weights: Optional[Any] = None
 
 
 def _run_flashinfer_b12x_w4a16(
@@ -78,6 +79,10 @@ def _run_flashinfer_b12x_w4a16(
         )
     if quant_info.moe_ep_size != 1:
         raise NotImplementedError("FlashInfer b12x W4A16 requires EP size 1.")
+    if runner_config.num_local_experts != runner_config.num_experts:
+        raise NotImplementedError(
+            "FlashInfer b12x W4A16 requires every expert to be local."
+        )
     if runner_config.activation != "silu" or not runner_config.is_gated:
         raise NotImplementedError(
             "The GLM b12x W4A16 path currently requires gated SiLU."
@@ -94,29 +99,36 @@ def _run_flashinfer_b12x_w4a16(
         ):
             output = torch.empty_like(x, dtype=torch.bfloat16)
 
-    from flashinfer.fused_moe.cute_dsl.b12x_moe import b12x_fused_moe
+    if quant_info.prepared_weights is None:
+        raise RuntimeError(
+            "SM12x E4M3-K32 W4A16 requires load-time in-place prepared weights"
+        )
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
+        launch_sm120_moe,
+    )
 
     w13_scale, w13_global_scale, w2_scale, w2_global_scale = (
         quant_info.quant_scales
     )
-    return b12x_fused_moe(
-        x=x,
+    return launch_sm120_moe(
+        a=x,
         w1_weight=quant_info.w13_weight,
         w1_weight_sf=w13_scale,
         w1_alpha=w13_global_scale,
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=w2_scale,
         w2_alpha=w2_global_scale,
-        token_selected_experts=topk_output.topk_ids.to(torch.int),
-        token_final_scales=topk_output.topk_weights,
+        topk_ids=topk_output.topk_ids.to(torch.int),
+        topk_weights=topk_output.topk_weights,
         num_experts=runner_config.num_experts,
         num_local_experts=runner_config.num_local_experts,
         top_k=runner_config.top_k,
-        output=output,
-        output_dtype=torch.bfloat16,
+        scatter_output=output,
         activation="silu",
         quant_mode="w4a16",
         source_format="modelopt_e4m3_k32",
+        _prepared_weights=quant_info.prepared_weights,
     )
 
 
