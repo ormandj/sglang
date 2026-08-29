@@ -716,6 +716,22 @@ class DeepseekSparseAttnBackend(
                     device=model_runner.device,
                 ),
             )
+            from flashinfer.mla import SparseMLASm120Wrapper
+
+            max_runner_tokens = max(
+                64,
+                int(getattr(model_runner.server_args, "chunked_prefill_size", 0) or 0),
+                int(getattr(model_runner.server_args, "max_prefill_tokens", 0) or 0),
+                model_runner.max_running_requests
+                * max(1, self.speculative_num_draft_tokens),
+            )
+            self.flashinfer_sparse_mla_runner = SparseMLASm120Wrapper(
+                max_num_tokens=max_runner_tokens,
+                max_num_heads=self.num_q_heads,
+                d_v=self.kv_lora_rank,
+                kv_scale_format="arbitrary_fp32",
+                device=model_runner.device,
+            )
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         elif self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
             self.workspace_buffer = get_buffer(
@@ -885,12 +901,13 @@ class DeepseekSparseAttnBackend(
         if (
             topk_indices is None
             or self.dsa_index_kpool <= 1
-            or dsa_impl in ("fa3", "tilelang", "trtllm")
+            or dsa_impl in ("fa3", "tilelang", "trtllm", "flashinfer_sparse_mla")
         ):
             return
         raise NotImplementedError(
             "index_kpool > 1 appends tail tokens to topk_indices and is "
-            f"currently only supported by the FA3/TileLang/TRTLLM DSA {phase} "
+            "currently only supported by the FA3/TileLang/TRTLLM/FlashInfer "
+            f"sparse-MLA DSA {phase} "
             "backend."
         )
 
@@ -4013,6 +4030,7 @@ class DeepseekSparseAttnBackend(
             indices=page_table_1,
             seq_lens=seq_lens,
             workspace_buffer=self.workspace_buffer,
+            runner=self.flashinfer_sparse_mla_runner,
             page_size=self.real_page_size,
             kv_cache_dim=self.kv_cache_dim,
             qk_nope_head_dim=self.qk_nope_head_dim,

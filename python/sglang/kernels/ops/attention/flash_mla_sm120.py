@@ -28,7 +28,12 @@ _is_hip = is_hip()
 _GLM_DSA_MODEL_ARCHS = (
     "GlmMoeDsaForCausalLM",
     "GlmMoeDsaForCausalLMNextN",
+    "Glm5NextForConditionalGeneration",
+    "Glm5NextForConditionalGenerationNextN",
 )
+
+_GLM53_NOPE_FLASHINFER_TOPK = 2176
+_GLM53_NOPE_FLASHINFER_KV_DIM = 656
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -610,6 +615,7 @@ def flashinfer_sparse_mla_forward(
     indices: torch.Tensor,
     seq_lens: torch.Tensor,
     workspace_buffer: torch.Tensor,
+    runner: object,
     *,
     page_size: int,
     kv_cache_dim: int,
@@ -619,26 +625,78 @@ def flashinfer_sparse_mla_forward(
     sm_scale: float,
     skip_softmax_threshold_scale_factor: float | None,
 ) -> torch.Tensor:
-    """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
-    from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
+    """Run FlashInfer's persistent native SM120 sparse-MLA wrapper.
 
-    topk = indices.shape[1]
-    result = trtllm_batch_decode_with_kv_cache_mla(
-        query=q.unsqueeze(1),
-        kv_cache=kv_cache.view(torch.uint8)
-        .view(-1, page_size, kv_cache_dim)
-        .unsqueeze(1),
-        workspace_buffer=workspace_buffer,
-        qk_nope_head_dim=qk_nope_head_dim,
-        kv_lora_rank=kv_lora_rank,
-        qk_rope_head_dim=qk_rope_head_dim,
-        block_tables=indices.unsqueeze(1),
-        seq_lens=seq_lens,
-        max_seq_len=topk,
-        sparse_mla_top_k=topk,
-        bmm1_scale=float(sm_scale),
-        bmm2_scale=1.0,
-        kv_scale_format="arbitrary_fp32",
-        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+    GLM-5.3 emits 2,051 candidates (2,048 selected plus its three-token KPool
+    tail).  FlashInfer's native NoPE kernels use the 2,176-wide physical
+    contract, so the unused right edge is padded with ``-1`` sentinels.  The
+    corresponding 656-byte KV row has 528 meaningful bytes and a reserved,
+    zero-filled 128-byte suffix.
+    """
+    if skip_softmax_threshold_scale_factor is not None:
+        raise ValueError(
+            "flashinfer_sparse_mla does not support skip-softmax thresholds"
+        )
+
+    is_glm53_nope = (
+        qk_nope_head_dim == 512
+        and kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+        and kv_cache_dim == _GLM53_NOPE_FLASHINFER_KV_DIM
     )
-    return result.squeeze(1)
+    if is_glm53_nope:
+        topk = indices.shape[-1]
+        if topk > _GLM53_NOPE_FLASHINFER_TOPK:
+            raise ValueError(
+                "GLM-5.3 native NoPE sparse MLA supports at most "
+                f"{_GLM53_NOPE_FLASHINFER_TOPK} candidates, got {topk}"
+            )
+        if topk < _GLM53_NOPE_FLASHINFER_TOPK:
+            indices = torch.nn.functional.pad(
+                indices,
+                (0, _GLM53_NOPE_FLASHINFER_TOPK - topk),
+                value=-1,
+            )
+
+    kv_cache_u8 = kv_cache.view(torch.uint8).view(
+        -1, page_size, kv_cache_dim
+    )
+    output = torch.empty(
+        q.shape[0], q.shape[1], kv_lora_rank, dtype=torch.bfloat16, device=q.device
+    )
+
+    mid_out = None
+    mid_lse = None
+    if q.shape[0] <= 64:
+        scratch_heads = 8 if q.shape[1] == 8 else math.ceil(q.shape[1] / 16) * 16
+        num_splits = math.ceil(indices.shape[-1] / 64)
+        mid_out_numel = q.shape[0] * scratch_heads * num_splits * kv_lora_rank
+        mid_out_bytes = mid_out_numel * torch.bfloat16.itemsize
+        mid_lse_numel = q.shape[0] * scratch_heads * num_splits
+        mid_lse_bytes = mid_lse_numel * torch.float32.itemsize
+        required_bytes = mid_out_bytes + mid_lse_bytes
+        available_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
+        if required_bytes > available_bytes:
+            raise ValueError(
+                "FlashInfer sparse-MLA decode workspace is too small: "
+                f"need {required_bytes} bytes, have {available_bytes}"
+            )
+        workspace_u8 = workspace_buffer.view(torch.uint8)
+        mid_out = workspace_u8[:mid_out_bytes].view(torch.bfloat16).view(
+            q.shape[0], scratch_heads, num_splits, kv_lora_rank
+        )
+        mid_lse = workspace_u8[
+            mid_out_bytes : mid_out_bytes + mid_lse_bytes
+        ].view(torch.float32).view(q.shape[0], scratch_heads, num_splits)
+
+    runner.run(
+        q,
+        kv_cache_u8,
+        indices,
+        output,
+        float(sm_scale),
+        topk_length=seq_lens,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+    return output
