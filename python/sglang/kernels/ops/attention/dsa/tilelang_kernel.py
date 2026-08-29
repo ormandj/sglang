@@ -1104,6 +1104,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     threads=256,
 ):
     assert d_v == 512, f"only support d_v=512"
+    assert d_tail >= 0, f"d_tail must be non-negative, got {d_tail}"
     assert (
         topk % block_I == 0
     ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
@@ -1178,8 +1179,9 @@ def sparse_mla_fwd_decode_partial_fp8(
             kv_tile1 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile2 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile3 = T.alloc_shared([BI, group_size], fp8_dtype)
-            q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
-            k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
+            if d_tail > 0:
+                q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
+                k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
             s_fp8_shared = T.alloc_shared([h_per_block, BI], fp8_dtype)
             page_idx_shared = T.alloc_shared([BI], T.int32)
 
@@ -1206,7 +1208,8 @@ def sparse_mla_fwd_decode_partial_fp8(
             T.fill(sumexp, 0)
             T.fill(m_i, -(2**30))
 
-            T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
+            if d_tail > 0:
+                T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
             T.copy(q_fp8[b_i, s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
             T.copy(q_fp8[b_i, s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
             T.copy(q_fp8[b_i, s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
@@ -1228,9 +1231,12 @@ def sparse_mla_fwd_decode_partial_fp8(
                     kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
                     kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
 
-                for bi_i, j in T.Parallel(BI, d_tail):
-                    page = page_idx_shared[bi_i]
-                    k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
+                if d_tail > 0:
+                    for bi_i, j in T.Parallel(BI, d_tail):
+                        page = page_idx_shared[bi_i]
+                        k_tail_shared[bi_i, j] = kv_fp8[
+                            b_i, page, g_i, rope_offset_fp8 + j
+                        ]
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -1247,13 +1253,18 @@ def sparse_mla_fwd_decode_partial_fp8(
                 T.gemm(q_tile3, kv_tile3, acc_tile, transpose_B=True, clear_accum=True)
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
-                T.gemm(
-                    q_tail_buf,
-                    k_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
+                # GLM-5.3-Flash uses the 512-wide NoPE layout, so d_tail is
+                # exactly zero.  Do not materialize a zero-K GEMM: TileLang's
+                # SM120 MMA layout inference rejects it as ``Unsupported
+                # k_dim 0`` even though other CUDA targets may fold it away.
+                if d_tail > 0:
+                    T.gemm(
+                        q_tail_buf,
+                        k_tail_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
