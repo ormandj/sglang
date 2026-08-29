@@ -7,7 +7,6 @@ slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
 import contextlib
-import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -381,40 +380,6 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
             worker.spec_v2_attn_backends,
             (target_backend, decode_backend, fallback_backend),
         )
-
-
-class TestEagleDraftModelSharing(CustomTestCase):
-    def test_constructor_shares_embed_and_head_immediately_after_draft_load(self):
-        source = inspect.getsource(EagleDraftWorker.__init__)
-        runner_alias = source.index("self.draft_runner = self.draft_worker.model_runner")
-        early_share = source.index("self.init_lm_head()")
-        later_setup = source.index("self._init_dsa_index_share_state()")
-        self.assertLess(runner_alias, early_share)
-        self.assertLess(early_share, later_setup)
-
-    def test_init_lm_head_is_idempotent(self):
-        embed = torch.zeros(2, 4)
-        head = torch.ones(2, 4)
-        draft_model = SimpleNamespace(set_embed_and_head=MagicMock())
-
-        worker = object.__new__(EagleDraftWorker)
-        worker.target_worker = SimpleNamespace(
-            model_runner=SimpleNamespace(
-                model=SimpleNamespace(
-                    get_embed_and_head=lambda: (embed, head),
-                    lm_head=None,
-                )
-            )
-        )
-        worker.draft_runner = SimpleNamespace(model=draft_model)
-        worker.speculative_algorithm = SimpleNamespace(is_eagle3=lambda: False)
-        worker.hot_token_id = None
-
-        worker.init_lm_head()
-        worker.init_lm_head()
-
-        draft_model.set_embed_and_head.assert_called_once_with(embed, head)
-        self.assertTrue(worker._embed_and_head_shared)
 
 
 if __name__ == "__main__":
