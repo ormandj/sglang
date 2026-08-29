@@ -598,7 +598,10 @@ def _validate_flashinfer_sparse_mla_backend(
             f"kv_cache_dtype={kv_cache_dtype}, prefill_impl={prefill_impl!r}, "
             f"decode_impl={decode_impl!r}."
         )
-    if is_glm_sm12_fp8:
+    # This validator owns only configurations that actually select the native
+    # FlashInfer backend.  Other GLM SM12 FP8 backend pairs (notably the raw
+    # TileLang path) have their own layout validation and must pass through.
+    if uses_flashinfer_sparse_mla and is_glm_sm12_fp8:
         unsupported = selected - {"flashinfer_sparse_mla"}
         if unsupported:
             raise ValueError(

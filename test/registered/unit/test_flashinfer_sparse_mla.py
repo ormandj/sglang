@@ -88,14 +88,14 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
                     )
                 )
 
-    def test_rejects_other_or_mixed_backends(self):
-        for prefill, decode in (
-            ("trtllm", "trtllm"),
-            ("flashinfer_sparse_mla", "trtllm"),
-        ):
+    def test_ignores_other_backends_when_flashinfer_is_not_selected(self):
+        for prefill, decode in (("tilelang", "tilelang"), ("trtllm", "trtllm")):
             with self.subTest(prefill=prefill, decode=decode):
-                with self.assertRaisesRegex(ValueError, "only flashinfer_sparse_mla"):
-                    self._validate(prefill, decode)
+                self.assertFalse(self._validate(prefill, decode))
+
+    def test_rejects_mixed_flashinfer_backend(self):
+        with self.assertRaisesRegex(ValueError, "only flashinfer_sparse_mla"):
+            self._validate("flashinfer_sparse_mla", "trtllm")
 
     def test_reports_unsupported_configuration(self):
         with self.assertRaises(ValueError) as error:
