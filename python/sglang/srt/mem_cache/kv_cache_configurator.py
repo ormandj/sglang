@@ -2299,10 +2299,9 @@ def calculate_mla_kv_cache_dim(
     if uses_trtllm_kv_layout:
         return kv_cache_dim
 
-    # FlashInfer's native GLM-5.3 NoPE SM120 kernel consumes the same 528
-    # meaningful bytes produced by SGLang's scaled FP8 writer, followed by a
-    # reserved 128-byte zero suffix.  The pools are zero-initialized, and the
-    # writer intentionally touches only the meaningful prefix.
+    # FlashInfer's native GLM-5.3 NoPE SM120 kernel consumes exactly the 528
+    # bytes produced by SGLang's scaled FP8 writer: 512 FP8 latent values plus
+    # four inline FP32 scales. No RoPE payload or compatibility suffix exists.
     uses_flashinfer_sparse_mla = (
         get_exec().kernel.dsa_prefill_backend == "flashinfer_sparse_mla"
         or get_exec().kernel.dsa_decode_backend == "flashinfer_sparse_mla"
@@ -2314,7 +2313,7 @@ def calculate_mla_kv_cache_dim(
         and kv_lora_rank == 512
         and uses_flashinfer_sparse_mla
     ):
-        return 656
+        return 528
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
     # nope(512 fp8) + rope(64 fp8), without extra per-block scales.

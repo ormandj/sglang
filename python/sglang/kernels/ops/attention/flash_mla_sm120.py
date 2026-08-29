@@ -33,7 +33,7 @@ _GLM_DSA_MODEL_ARCHS = (
 )
 
 _GLM53_NOPE_FLASHINFER_TOPK = 2176
-_GLM53_NOPE_FLASHINFER_KV_DIM = 656
+_GLM53_NOPE_FLASHINFER_KV_DIM = 528
 
 # Page layout constants for DSv4-Flash (MODEL1):
 #   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
@@ -633,8 +633,8 @@ def flashinfer_sparse_mla_forward(
     GLM-5.3 emits 2,051 candidates (2,048 selected plus its three-token KPool
     tail).  FlashInfer's native NoPE kernels use the 2,176-wide physical
     contract, so the unused right edge is padded with ``-1`` sentinels.  The
-    corresponding 656-byte KV row has 528 meaningful bytes and a reserved,
-    zero-filled 128-byte suffix.
+    corresponding KV row is packed to the 528 meaningful bytes: 512 FP8
+    latent values followed by four inline FP32 scales.
     """
     if skip_softmax_threshold_scale_factor is not None:
         raise ValueError(

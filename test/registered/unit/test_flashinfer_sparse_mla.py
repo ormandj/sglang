@@ -35,13 +35,13 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
         indices[1, :3] = torch.tensor([4, 6, 8], dtype=torch.int32)
         output = flashinfer_sparse_mla_forward(
             q=torch.zeros((2, 8, 512), dtype=torch.bfloat16),
-            kv_cache=torch.zeros((128, 1, 656), dtype=torch.uint8),
+            kv_cache=torch.zeros((128, 1, 528), dtype=torch.uint8),
             indices=indices,
             seq_lens=torch.tensor([2, 3], dtype=torch.int32),
             workspace_buffer=torch.zeros(2 * 1024 * 1024, dtype=torch.uint8),
             runner=FakeRunner(),
             page_size=64,
-            kv_cache_dim=656,
+            kv_cache_dim=528,
             # This is the checkpoint's pre-absorption dimension. The query
             # reaching the native sparse-MLA kernel is 512 wide.
             qk_nope_head_dim=256,
@@ -52,7 +52,7 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
         )
 
         self.assertEqual(tuple(captured["q"].shape), (2, 8, 512))
-        self.assertEqual(tuple(captured["kv_cache"].shape), (2, 64, 656))
+        self.assertEqual(tuple(captured["kv_cache"].shape), (2, 64, 528))
         self.assertEqual(tuple(captured["indices"].shape), (2, 2176))
         self.assertEqual(captured["indices"][0, :4].tolist(), [7, 9, -1, -1])
         self.assertTrue(torch.all(captured["indices"][:, 2051:] == -1))
@@ -114,7 +114,7 @@ class TestFlashInferSparseMLABackendGate(unittest.TestCase):
 
 
 class TestFlashInferSparseMLAKVLayout(unittest.TestCase):
-    def test_glm53_nope_uses_native_656_byte_row(self):
+    def test_glm53_nope_uses_native_528_byte_row(self):
         model_config = SimpleNamespace(
             hf_config=SimpleNamespace(),
             kv_lora_rank=512,
@@ -138,7 +138,7 @@ class TestFlashInferSparseMLAKVLayout(unittest.TestCase):
                     model_config=model_config,
                     kv_cache_dtype=torch.float8_e4m3fn,
                 ),
-                656,
+                528,
             )
 
 
