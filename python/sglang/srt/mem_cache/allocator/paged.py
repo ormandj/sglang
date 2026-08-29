@@ -424,12 +424,17 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             positions = []
             old_values = []
             new_values = []
+        from sglang.srt.layers.attention.dsa.graph_buffer_lifetime import (
+            describe_graph_buffer_overlap,
+        )
+
         raise AssertionError(
             "page allocator state changed between operations: "
             f"previous={self._debug_free_pages_boundary} current={boundary} "
             f"before={self._debug_free_pages_metadata} after={metadata} "
             f"positions={positions} old_values={old_values} "
-            f"new_values={new_values}"
+            f"new_values={new_values} "
+            f"dsa_graph_buffers={describe_graph_buffer_overlap(pages)}"
         )
 
     def _debug_capture_free_pages(self, boundary: str) -> None:

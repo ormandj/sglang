@@ -1177,6 +1177,10 @@ class UnifiedRadixCache(BasePrefixCache):
             checksum = int(flat.sum(dtype=torch.int64).item())
             invalid = (flat < 1) | (flat >= high)
             if value.dtype != torch.int64 or bool(invalid.any().item()):
+                from sglang.srt.layers.attention.dsa.graph_buffer_lifetime import (
+                    describe_graph_buffer_overlap,
+                )
+
                 positions = torch.nonzero(invalid, as_tuple=False).reshape(-1)[:8]
                 values = flat[positions].detach().cpu().tolist()
                 raise AssertionError(
@@ -1186,7 +1190,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     f"data_ptr={data_ptr} storage_ptr={storage_ptr} "
                     f"storage_offset={storage_offset} "
                     f"storage_nbytes={storage_nbytes} checksum={checksum} "
-                    f"positions={positions.detach().cpu().tolist()} values={values}"
+                    f"positions={positions.detach().cpu().tolist()} values={values} "
+                    f"dsa_graph_buffers={describe_graph_buffer_overlap(value)}"
                 )
             snapshots[node_id] = _FullValueSnapshot(
                 parent_id=parent_id,

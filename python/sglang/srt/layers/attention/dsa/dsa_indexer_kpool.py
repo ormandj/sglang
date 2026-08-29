@@ -14,6 +14,9 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
+from sglang.srt.layers.attention.dsa.graph_buffer_lifetime import (
+    register_graph_buffer,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -918,6 +921,8 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
 
+        register_graph_buffer(logits, f"kpool-logits-layer-{layer_id}")
+
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
         topk_result = self._topk_from_kpool_logits(
             logits,
@@ -927,6 +932,7 @@ class IndexerKPool(MultiPlatformOp):
             topk_offsets=topk_offsets,
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
+        register_graph_buffer(topk_result, f"kpool-topk-layer-{layer_id}")
         return topk_result
 
     def _should_chunk_mqa_logits(
