@@ -28,6 +28,7 @@ from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
+from sglang.srt import envs
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -35,7 +36,7 @@ from sglang.srt.utils import (
     is_hip,
     next_power_of_2,
 )
-from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.async_probe import maybe_detect_oob, maybe_sync_detect_oob
 
 _is_hip = is_hip()
 
@@ -125,6 +126,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         super().__init__(size, page_size, dtype, device, kvcache, need_sort)
         self.num_pages = size // page_size
         self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+        self._debug_free_pages_snapshot = None
+        self._debug_free_pages_metadata = None
+        self._debug_free_pages_boundary = None
 
         # Pre-warm the torch.unique HIP kernel used in free(). When a request
         # finishes with a prompt that already exists in the radix tree (e.g.
@@ -148,6 +152,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.clear()
 
     def alloc(self, need_size: int):
+        self._debug_check_free_pages("before alloc")
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:
             assert (
@@ -162,6 +167,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = self.free_pages[:num_pages]
         self.free_pages = self.free_pages[num_pages:]
+        self._debug_capture_free_pages("after alloc")
 
         out_indices = (
             out_pages[:, None] * self.page_size
@@ -180,6 +186,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
     ):
+        self._debug_check_free_pages("before alloc_extend")
         # Keep the three inputs to alloc_extend_kernel independently attributable
         # under the legacy async-assert diagnostic. A negative output can come
         # from a stale prefix tail, a poisoned free-page list, or an incomplete
@@ -241,6 +248,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
+        self._debug_capture_free_pages("after alloc_extend")
         return out_indices
 
     def alloc_decode(
@@ -249,6 +257,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
+        self._debug_check_free_pages("before alloc_decode")
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
@@ -280,12 +289,19 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return None
 
         self.free_pages = self.free_pages[num_new_pages:]
+        self._debug_capture_free_pages("after alloc_decode")
         return out_indices
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
             return
 
+        maybe_sync_detect_oob(
+            free_index,
+            1,
+            self.size + self.page_size,
+            "PagedTokenToKVPoolAllocator.free input",
+        )
         maybe_detect_oob(
             free_index,
             1,
@@ -309,6 +325,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        maybe_sync_detect_oob(
+            free_index,
+            1,
+            self.size + self.page_size,
+            "PagedTokenToKVPoolAllocator.free_segment input",
+        )
         maybe_detect_oob(
             free_index,
             1,
@@ -346,10 +368,85 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        self._debug_check_free_pages("before release")
         if self.need_sort:
             self.release_pages = torch.cat((*page_ids, self.release_pages))
         else:
             self.free_pages = torch.cat((*page_ids, self.free_pages))
+        self._debug_capture_free_pages("after release")
+
+    def merge_and_sort_free(self):
+        self._debug_check_free_pages("before merge")
+        super().merge_and_sort_free()
+        self._debug_capture_free_pages("after merge")
+
+    @staticmethod
+    def _debug_pages_metadata(pages: torch.Tensor) -> tuple[int, int, int, int, int]:
+        storage = pages.untyped_storage()
+        return (
+            pages.numel(),
+            pages.data_ptr(),
+            storage.data_ptr(),
+            pages.storage_offset(),
+            storage.nbytes(),
+        )
+
+    @staticmethod
+    def _debug_sync_pages(pages: torch.Tensor) -> None:
+        if pages.is_cuda:
+            torch.cuda.synchronize(pages.device)
+
+    def _debug_check_free_pages(self, boundary: str) -> None:
+        if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            return
+        pages = self.free_pages
+        self._debug_sync_pages(pages)
+        maybe_sync_detect_oob(
+            pages,
+            1,
+            self.num_pages + 1,
+            f"PagedTokenToKVPoolAllocator.free_pages at {boundary}",
+        )
+        expected = self._debug_free_pages_snapshot
+        if expected is None:
+            return
+        metadata = self._debug_pages_metadata(pages)
+        if metadata == self._debug_free_pages_metadata and torch.equal(pages, expected):
+            return
+        if pages.numel() == expected.numel():
+            positions = torch.nonzero(
+                pages.reshape(-1) != expected.reshape(-1), as_tuple=False
+            ).reshape(-1)[:8]
+            old_values = expected.reshape(-1)[positions].detach().cpu().tolist()
+            new_values = pages.reshape(-1)[positions].detach().cpu().tolist()
+            positions = positions.detach().cpu().tolist()
+        else:
+            positions = []
+            old_values = []
+            new_values = []
+        raise AssertionError(
+            "page allocator state changed between operations: "
+            f"previous={self._debug_free_pages_boundary} current={boundary} "
+            f"before={self._debug_free_pages_metadata} after={metadata} "
+            f"positions={positions} old_values={old_values} "
+            f"new_values={new_values}"
+        )
+
+    def _debug_capture_free_pages(self, boundary: str) -> None:
+        if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            return
+        pages = self.free_pages
+        self._debug_sync_pages(pages)
+        maybe_sync_detect_oob(
+            pages,
+            1,
+            self.num_pages + 1,
+            f"PagedTokenToKVPoolAllocator.free_pages at {boundary}",
+        )
+        self._debug_free_pages_snapshot = pages.detach().clone()
+        self._debug_free_pages_metadata = self._debug_pages_metadata(pages)
+        self._debug_free_pages_boundary = boundary
+        self._debug_sync_pages(self._debug_free_pages_snapshot)
 
     def free_group_begin(self):
         super().free_group_begin()
@@ -374,6 +471,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = None
         self.free_page_reps_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        self._debug_capture_free_pages("after clear")
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         return self._kvcache.get_cpu_copy(
