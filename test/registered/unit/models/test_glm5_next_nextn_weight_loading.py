@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.models.deepseek_nextn import DeepseekModelNextN
 from sglang.srt.models.glm5_next_nextn import (
     Glm5NextForConditionalGenerationNextN,
 )
@@ -19,7 +20,62 @@ class _FakeParam:
         self.loaded = loaded_weight
 
 
+class _FakeModelOptFp4Config:
+    def get_name(self):
+        return "modelopt_fp4"
+
+
 class TestGlm5NextNextNWeightLoading(unittest.TestCase):
+    def test_deepseek_modelopt_fp4_default_remains_unquantized(self):
+        quant_config = _FakeModelOptFp4Config()
+
+        resolved = DeepseekModelNextN._resolve_modelopt_fp4_quant_config(
+            quant_config, preserve_modelopt_fp4_quant_config=False
+        )
+
+        self.assertIsNone(resolved)
+
+    def test_glm_can_preserve_modelopt_fp4_in_nextn_constructor(self):
+        quant_config = _FakeModelOptFp4Config()
+
+        resolved = DeepseekModelNextN._resolve_modelopt_fp4_quant_config(
+            quant_config,
+            preserve_modelopt_fp4_quant_config=(
+                Glm5NextForConditionalGenerationNextN.preserve_modelopt_fp4_nextn
+            ),
+        )
+
+        self.assertIs(resolved, quant_config)
+
+    def test_quantized_glm_nextn_preserves_modelopt_fp4(self):
+        quant_config = _FakeModelOptFp4Config()
+        config = SimpleNamespace(
+            num_hidden_layers=45,
+            quantization_config={"ignore": ["*.self_attn.*"]},
+        )
+
+        resolved = Glm5NextForConditionalGenerationNextN.__new__(
+            Glm5NextForConditionalGenerationNextN
+        )._resolve_nextn_quant_config(config, quant_config)
+
+        self.assertIs(resolved, quant_config)
+        self.assertTrue(
+            Glm5NextForConditionalGenerationNextN.preserve_modelopt_fp4_nextn
+        )
+
+    def test_bf16_glm_nextn_still_drops_modelopt_fp4(self):
+        quant_config = _FakeModelOptFp4Config()
+        config = SimpleNamespace(
+            num_hidden_layers=45,
+            quantization_config={"ignore": ["model.layers.45.*"]},
+        )
+
+        resolved = Glm5NextForConditionalGenerationNextN.__new__(
+            Glm5NextForConditionalGenerationNextN
+        )._resolve_nextn_quant_config(config, quant_config)
+
+        self.assertIsNone(resolved)
+
     def test_checkpoint_qkv_sources_load_fused_projection(self):
         fused_param = _FakeParam()
         model = SimpleNamespace(

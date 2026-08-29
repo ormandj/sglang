@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
+    # GLM checkpoints may serialize the routed experts in the native draft
+    # layer as ModelOpt FP4. The resolver below still returns None when the
+    # complete layer is explicitly ignored and stored in BF16.
+    preserve_modelopt_fp4_nextn = True
+
     @classmethod
     def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
         text_config = getattr(config, "text_config", config)

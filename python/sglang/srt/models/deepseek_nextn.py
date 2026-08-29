@@ -100,11 +100,28 @@ _is_npu = is_npu()
 
 class DeepseekModelNextN(nn.Module):
 
+    @staticmethod
+    def _resolve_modelopt_fp4_quant_config(
+        quant_config: Optional[QuantizationConfig],
+        preserve_modelopt_fp4_quant_config: bool,
+    ) -> Optional[QuantizationConfig]:
+        if (
+            not preserve_modelopt_fp4_quant_config
+            and quant_config is not None
+            and quant_config.get_name() == "modelopt_fp4"
+        ):
+            logger.warning(
+                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
+            )
+            return None
+        return quant_config
+
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        preserve_modelopt_fp4_quant_config: bool = False,
     ) -> None:
         super().__init__()
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
@@ -116,11 +133,9 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.warning(
-                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
-            )
-            quant_config = None
+        quant_config = self._resolve_modelopt_fp4_quant_config(
+            quant_config, preserve_modelopt_fp4_quant_config
+        )
 
         self.vocab_size = config.vocab_size
 
@@ -312,6 +327,7 @@ class DeepseekModelNextN(nn.Module):
 class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
     # The draft checkpoint reports the NextN architecture name.
     fused_shared_experts_architecture = "DeepseekV3ForCausalLMNextN"
+    preserve_modelopt_fp4_nextn = False
 
     # Support amd/DeepSeek-R1-0528-MXFP4 renaming: model.layers.61*.
     # Ref: HF config.json for amd/DeepSeek-R1-0528-MXFP4
@@ -366,7 +382,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
-            config, nextn_quant_config, prefix=add_prefix("model", prefix)
+            config,
+            nextn_quant_config,
+            prefix=add_prefix("model", prefix),
+            preserve_modelopt_fp4_quant_config=self.preserve_modelopt_fp4_nextn,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
