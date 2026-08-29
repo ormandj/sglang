@@ -9,6 +9,8 @@ under spec, see MambaPool). If the MambaPool allocation changes shape, update
 both the allocation and this expectation together.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -19,7 +21,10 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateDType,
     Mamba2StateShape,
 )
-from sglang.srt.mem_cache.kv_cache_configurator import _pp_local_per_request_bytes
+from sglang.srt.mem_cache.kv_cache_configurator import (
+    KVCacheConfigurator,
+    _pp_local_per_request_bytes,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -63,6 +68,25 @@ def _gdn_params():
 
 
 class TestReplaySSMRingAccounting(CustomTestCase):
+    def test_kda_capability_uses_cache_parameter_contract(self):
+        # GLM-5.3 exposes KimiLinearCacheParams but is not a Kimi model. The
+        # state contract, rather than a model-family lookup, must enable the
+        # ReplaySSM pool and memory-solver paths.
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.hybrid_gdn_config = None
+        configurator.mambaish_config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(is_kda=True)
+        )
+        self.assertTrue(configurator._supports_linear_replayssm_spec())
+
+    def test_non_linear_state_is_not_replayssm_capable(self):
+        configurator = object.__new__(KVCacheConfigurator)
+        configurator.hybrid_gdn_config = None
+        configurator.mambaish_config = SimpleNamespace(
+            mamba2_cache_params=SimpleNamespace(is_kda=False)
+        )
+        self.assertFalse(configurator._supports_linear_replayssm_spec())
+
     def test_gdn_fold(self):
         # fold window: rawv 512 + rawk 512 + g(scalar, 4*8*4) 128 + beta 128 = 1280
         self.assertEqual(
