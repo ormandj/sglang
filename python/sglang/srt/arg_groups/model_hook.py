@@ -33,6 +33,21 @@ from sglang.srt.utils.common import (
 logger = logging.getLogger(__name__)
 
 
+def _apply_glm5_next_sm120_defaults(model_arch: str) -> None:
+    """Disable the DeepGEMM-only HC prenorm on consumer Blackwell.
+
+    ``Glm5NextForConditionalGeneration`` uses the same mHC implementation as
+    DeepSeek V4, but it is not covered by the DeepSeek-V4-specific SM120 hook
+    below.  DeepGEMM is intentionally unavailable on SM120 because the device
+    lacks TMEM/tcgen05; leaving its independent HC-prenorm flag enabled reaches
+    ``tf32_hc_prenorm_gemm`` with no imported ``deep_gemm`` module on the first
+    forward pass.  Keep the rest of the GLM defaults intact and select the
+    supported TileLang mHC fallback by disabling only that optimization.
+    """
+    if model_arch == "Glm5NextForConditionalGeneration" and is_sm120_supported():
+        envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+
+
 def handle_model_specific_adjustments(server_args: Any):
     cfg = resolving_view(server_args)
     from sglang.srt.configs.model_config import (
@@ -60,6 +75,7 @@ def handle_model_specific_adjustments(server_args: Any):
     model_config = server_args.get_model_config()
     hf_config = model_config.hf_config
     model_arch = hf_config.architectures[0]
+    _apply_glm5_next_sm120_defaults(model_arch)
 
     if model_arch == "InternS2MobiusForConditionalGeneration":
         unsupported = []
