@@ -3,6 +3,8 @@
 Ported from the probe validated on sm_121 (DGX Spark GB10); requires SM89+
 for fp8 tensor-core MMA. Two properties, each of which has been observed to
 fail when the path is broken:
+  0. compile: GLM's NoPE geometry has no RoPE tail (d_tail=0), which must not
+     lower a zero-K GEMM on SM120;
   1. one-hot: a single valid index per token makes softmax exactly 1.0 and
      the fp8 prob-quant exact, so the kernel must return the gathered V row
      nearly bit-exactly (decisive for gather/mask/normalize plumbing);
