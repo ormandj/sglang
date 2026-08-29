@@ -46,10 +46,24 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args, get_stream
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+
+def _get_compress_gate_stream(alt_stream: Optional[torch.cuda.Stream]):
+    """Return the process/device stream shared by every k-pool indexer.
+
+    A layer waits for its compression-gate GEMM before its k-pool write, and
+    the forward stream then waits for that write before advancing to the next
+    layer. Compression-gate work from two layers therefore cannot overlap.
+    Keeping one stream per layer only creates one cuBLAS handle/workspace per
+    full-attention layer (32 MiB each on CUDA) without adding concurrency.
+    """
+    if not is_cuda() or alt_stream is None:
+        return None
+    return get_stream("dsa_index_compress_gate")
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -83,7 +97,7 @@ class IndexerKPool(MultiPlatformOp):
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.compress_gate_stream = None
+        self.compress_gate_stream = _get_compress_gate_stream(alt_stream)
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         self.cp_size = get_parallel().attn_cp_size if self.dsa_enable_prefill_cp else 1
         self.skip_rope = skip_rope
@@ -112,9 +126,6 @@ class IndexerKPool(MultiPlatformOp):
         self.index_kpool_compress_gate = nn.Parameter(
             torch.empty(self.head_dim, self.hidden_size, dtype=torch.bfloat16)
         )
-
-        if is_cuda() and self.alt_stream is not None:
-            self.compress_gate_stream = torch.cuda.Stream()
 
         if is_cuda():
             self.sm_count = deep_gemm.get_num_sms()
