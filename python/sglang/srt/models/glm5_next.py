@@ -1360,6 +1360,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
         model_dtype = (
             getattr(linear_attn.o_proj, "params_dtype", None) or torch.bfloat16
         )
+        # Route packing specializes on both token capacity and the selected
+        # routed block size. Cover the shape regimes used by tool/vision
+        # prefills and 4K chunked long-context work while memory is still
+        # available; otherwise Triton loads those modules on the first request
+        # after pools and CUDA graphs have consumed nearly all device memory.
+        route_pack_compiled = [
+            precompile_w4a16_prefill_routes(
+                device=device,
+                num_experts=self.config.n_routed_experts,
+                top_k=self.config.num_experts_per_tok,
+                prefill_tokens=prefill_tokens,
+            )
+            for prefill_tokens in (256, 320, 512, 1024, 2048, 4096, 8192)
+        ]
         compiled = [
             precompile_kda_prefill_kernels(
                 num_heads=linear_attn.local_num_heads,
@@ -1371,11 +1385,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 lower_bound=linear_attn.attn.lower_bound,
             ),
             precompile_index_prefix_gather(device),
-            precompile_w4a16_prefill_routes(
-                device=device,
-                num_experts=self.config.n_routed_experts,
-                top_k=self.config.num_experts_per_tok,
-            ),
+            any(route_pack_compiled),
         ]
         if any(compiled):
             log_info_on_rank0(
