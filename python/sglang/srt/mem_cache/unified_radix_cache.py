@@ -84,6 +84,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.runtime_context import get_memory, get_observability
 from sglang.srt.session.streaming_session import StreamingSession
+from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -872,6 +873,26 @@ class UnifiedRadixCache(BasePrefixCache):
             page_aligned_len = len(radix_key)
             values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
+            if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+                logger.warning(
+                    "Radix diagnostic cache_finished insert: kv_len=%d "
+                    "token_len=%d aligned_len=%d allocated_len=%d "
+                    "committed_len=%d output_len=%d finished_len=%s",
+                    kv_len_to_handle,
+                    len(token_ids),
+                    page_aligned_len,
+                    req.kv.kv_allocated_len,
+                    req.kv_committed_len,
+                    len(req.output_ids),
+                    req.finished_len,
+                )
+            maybe_detect_oob(
+                values,
+                1,
+                self.token_to_kv_pool_allocator.size + self.page_size,
+                "UnifiedRadixCache.cache_finished_req insert values",
+            )
+
             insert_params.key = radix_key
             insert_params.value = values
             result = self.insert(insert_params)
@@ -969,6 +990,24 @@ class UnifiedRadixCache(BasePrefixCache):
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
+
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            logger.warning(
+                "Radix diagnostic cache_unfinished insert: fill_len=%d "
+                "effective_len=%d aligned_len=%d allocated_len=%d "
+                "committed_len=%d",
+                len(token_ids),
+                effective_cache_len,
+                page_aligned_len,
+                req.kv.kv_allocated_len,
+                req.kv_committed_len,
+            )
+        maybe_detect_oob(
+            values,
+            1,
+            self.token_to_kv_pool_allocator.size + self.page_size,
+            "UnifiedRadixCache.cache_unfinished_req insert values",
+        )
 
         insert_params.key = radix_key
         insert_params.value = values

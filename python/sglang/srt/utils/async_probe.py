@@ -131,10 +131,24 @@ def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: 
         return
     if indices is None or indices.numel() == 0:
         return
-    torch._assert_async(
-        indices.min() >= low,
-        f"index < {low} (negative / unmasked sentinel?): {msg}",
-    )
+    # Slot allocators reserve physical index 0 for padded CUDA-graph work.  Keep
+    # negative and reserved-zero failures distinct when callers require a real
+    # slot (low == 1); otherwise the first allocator corruption report only says
+    # ``index < 1`` and cannot tell an unmasked -1 sentinel from an unwritten 0.
+    if low == 1:
+        torch._assert_async(
+            indices.min() >= 0,
+            f"index < 0 (negative / unmasked sentinel?): {msg}",
+        )
+        torch._assert_async(
+            (indices != 0).all(),
+            f"index == 0 (reserved / unwritten slot?): {msg}",
+        )
+    else:
+        torch._assert_async(
+            indices.min() >= low,
+            f"index < {low} (negative / unmasked sentinel?): {msg}",
+        )
     torch._assert_async(
         indices.max() < high,
         f"index >= {high} (out of range): {msg}",
