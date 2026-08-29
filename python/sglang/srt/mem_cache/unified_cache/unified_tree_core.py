@@ -2570,6 +2570,28 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return torch.cat(values)
         return torch.tensor([], dtype=torch.int64, device=self.device)
 
+    def debug_full_value_records(
+        self,
+    ) -> list[tuple[int, Optional[int], int, torch.Tensor]]:
+        """Describe every reachable Full value without exposing keys/tokens."""
+        records = []
+        stack = list(self.root_node.children.values())
+        while stack:
+            node = stack.pop()
+            value = node.component_data[BASE_COMPONENT_TYPE].value
+            if value is not None:
+                records.append(
+                    (
+                        node.id,
+                        node.parent.id if node.parent is not None else None,
+                        len(node.key),
+                        value,
+                    )
+                )
+            stack.extend(node.children.values())
+        records.sort(key=lambda record: record[0])
+        return records
+
     def _all_component_values_flatten(
         self, component_type: ComponentType
     ) -> torch.Tensor:

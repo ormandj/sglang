@@ -321,6 +321,16 @@ class UnifiedTreeCoreInterface(ABC):
     @abstractmethod
     def all_mamba_values_flatten(self) -> torch.Tensor: ...
 
+    def debug_full_value_records(
+        self,
+    ) -> list[tuple[int, Optional[int], int, torch.Tensor]]:
+        """Return reachable Full values plus non-content node metadata.
+
+        This diagnostic-only surface intentionally has a default so alternative
+        TreeCore backends do not have to implement Python tensor inspection.
+        """
+        return []
+
     @abstractmethod
     def walk_for_kv_canary(
         self, unlocked_only: bool, swa_resident_only: bool

@@ -147,6 +147,19 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
+class _FullValueSnapshot(NamedTuple):
+    parent_id: Optional[NodeId]
+    key_len: int
+    dtype: torch.dtype
+    numel: int
+    data_ptr: int
+    storage_ptr: int
+    storage_offset: int
+    storage_nbytes: int
+    checksum: int
+    value: torch.Tensor
+
+
 class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
@@ -541,9 +554,12 @@ class UnifiedRadixCache(BasePrefixCache):
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
+            self._debug_full_value_snapshot("insert start")
             step = self.tree_core.begin_insert(params)
             while True:
+                self._debug_full_value_snapshot("insert step before actions")
                 self._apply_cache_actions(step.actions)
+                self._debug_full_value_snapshot("insert step after actions")
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
@@ -1112,9 +1128,149 @@ class UnifiedRadixCache(BasePrefixCache):
         actions.reverse()
         try:
             while actions:
-                self._apply_cache_action(actions.pop())
+                action = actions.pop()
+                action_name = type(action).__name__
+                before = self._debug_full_value_snapshot(f"before action {action_name}")
+                self._debug_assert_frees_not_reachable(action)
+                self._apply_cache_action(action)
+                # Drop the action's tensor references before synchronizing and
+                # comparing. This is the lifetime boundary most likely to expose
+                # a late writer into allocator-reused storage.
+                del action
+                self._debug_assert_full_value_snapshot_unchanged(
+                    before, f"after action {action_name}"
+                )
         finally:
             actions.reverse()
+
+    @staticmethod
+    def _debug_tensor_metadata(value: torch.Tensor) -> tuple[int, int, int, int]:
+        storage = value.untyped_storage()
+        return (
+            value.data_ptr(),
+            storage.data_ptr(),
+            value.storage_offset(),
+            storage.nbytes(),
+        )
+
+    @staticmethod
+    def _debug_sync_records(records) -> None:
+        devices = {value.device for _, _, _, value in records if value.is_cuda}
+        for device in devices:
+            torch.cuda.synchronize(device)
+
+    def _debug_full_value_snapshot(
+        self, boundary: str
+    ) -> Optional[dict[NodeId, _FullValueSnapshot]]:
+        """Synchronously validate and copy every reachable Full value."""
+        if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            return None
+        records = self.tree_core.debug_full_value_records()
+        self._debug_sync_records(records)
+        snapshots = {}
+        high = self.token_to_kv_pool_allocator.size + self.page_size
+        for node_id, parent_id, key_len, value in records:
+            flat = value.reshape(-1)
+            data_ptr, storage_ptr, storage_offset, storage_nbytes = (
+                self._debug_tensor_metadata(value)
+            )
+            checksum = int(flat.sum(dtype=torch.int64).item())
+            invalid = (flat < 1) | (flat >= high)
+            if value.dtype != torch.int64 or bool(invalid.any().item()):
+                positions = torch.nonzero(invalid, as_tuple=False).reshape(-1)[:8]
+                values = flat[positions].detach().cpu().tolist()
+                raise AssertionError(
+                    f"reachable Full value invalid at {boundary}: "
+                    f"node={node_id} parent={parent_id} key_len={key_len} "
+                    f"dtype={value.dtype} numel={value.numel()} "
+                    f"data_ptr={data_ptr} storage_ptr={storage_ptr} "
+                    f"storage_offset={storage_offset} "
+                    f"storage_nbytes={storage_nbytes} checksum={checksum} "
+                    f"positions={positions.detach().cpu().tolist()} values={values}"
+                )
+            snapshots[node_id] = _FullValueSnapshot(
+                parent_id=parent_id,
+                key_len=key_len,
+                dtype=value.dtype,
+                numel=value.numel(),
+                data_ptr=data_ptr,
+                storage_ptr=storage_ptr,
+                storage_offset=storage_offset,
+                storage_nbytes=storage_nbytes,
+                checksum=checksum,
+                value=value.detach().clone(),
+            )
+        self._debug_sync_records(records)
+        return snapshots
+
+    def _debug_assert_full_value_snapshot_unchanged(
+        self,
+        before: Optional[dict[NodeId, _FullValueSnapshot]],
+        boundary: str,
+    ) -> None:
+        if before is None:
+            return
+        after = self._debug_full_value_snapshot(boundary)
+        assert after is not None
+        if before.keys() != after.keys():
+            raise AssertionError(
+                f"reachable Full node set changed at {boundary}: "
+                f"removed={sorted(before.keys() - after.keys())[:8]} "
+                f"added={sorted(after.keys() - before.keys())[:8]}"
+            )
+        for node_id, old in before.items():
+            new = after[node_id]
+            old_metadata = old[:-1]
+            new_metadata = new[:-1]
+            if old_metadata != new_metadata or not torch.equal(old.value, new.value):
+                old_flat = old.value.reshape(-1)
+                new_flat = new.value.reshape(-1)
+                mismatch = torch.nonzero(old_flat != new_flat, as_tuple=False).reshape(
+                    -1
+                )[:8]
+                raise AssertionError(
+                    f"reachable Full value changed at {boundary}: node={node_id} "
+                    f"before={old_metadata} after={new_metadata} "
+                    f"positions={mismatch.detach().cpu().tolist()} "
+                    f"old_values={old_flat[mismatch].detach().cpu().tolist()} "
+                    f"new_values={new_flat[mismatch].detach().cpu().tolist()}"
+                )
+
+    def _debug_assert_frees_not_reachable(
+        self, action: CacheAction | ComponentAction
+    ) -> None:
+        """Reject an allocator free overlapping reachable Full tensor storage."""
+        if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            return
+        if not isinstance(
+            action, (FreeDeviceKV, FreeDeviceKVFullOnly, FreeComponentDeviceSlot)
+        ):
+            return
+        records = self.tree_core.debug_full_value_records()
+        self._debug_sync_records(records)
+        for free_index, (node_id, parent_id, key_len, value) in (
+            (free_index, record) for free_index in action.indices for record in records
+        ):
+            if free_index.numel() == 0 or value.numel() == 0:
+                continue
+            if free_index.device != value.device:
+                continue
+            assert free_index.is_contiguous() and value.is_contiguous()
+            free_start = free_index.data_ptr()
+            free_end = free_start + free_index.numel() * free_index.element_size()
+            value_start = value.data_ptr()
+            value_end = value_start + value.numel() * value.element_size()
+            if max(free_start, value_start) < min(free_end, value_end):
+                raise AssertionError(
+                    "allocator free aliases reachable Full value: "
+                    f"action={type(action).__name__} "
+                    f"component={getattr(action, 'component_type', None)} "
+                    f"free_dtype={free_index.dtype} free_numel={free_index.numel()} "
+                    f"free_data_ptr={free_start} node={node_id} "
+                    f"parent={parent_id} key_len={key_len} "
+                    f"value_dtype={value.dtype} value_numel={value.numel()} "
+                    f"value_data_ptr={value_start}"
+                )
 
     def _apply_cache_action(self, action: CacheAction | ComponentAction) -> None:
         # Component actions route to their component class; the rest are

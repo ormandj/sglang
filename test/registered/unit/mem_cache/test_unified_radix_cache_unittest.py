@@ -7133,6 +7133,45 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
             [mock.call(first), mock.call(second)]
         )
 
+    @staticmethod
+    def _make_full_value_debug_cache(value):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.tree_core = mock.Mock(page_size=1)
+        cache.tree_core.debug_full_value_records.return_value = [
+            (17, 3, value.numel(), value)
+        ]
+        cache.token_to_kv_pool_allocator = mock.Mock(size=256)
+        return cache
+
+    def test_action_probe_rejects_reachable_full_storage_free(self):
+        value = torch.tensor([4, 5], dtype=torch.int64)
+        cache = self._make_full_value_debug_cache(value)
+        action = FreeDeviceKV([value[:1]])
+
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
+            with self.assertRaisesRegex(
+                AssertionError, "allocator free aliases reachable Full value"
+            ):
+                cache._apply_cache_actions([action])
+
+        cache.token_to_kv_pool_allocator.free_segment.assert_not_called()
+
+    def test_action_probe_detects_reachable_full_value_mutation(self):
+        value = torch.tensor([4, 5], dtype=torch.int64)
+        cache = self._make_full_value_debug_cache(value)
+
+        def mutate_full_value(*args, **kwargs):
+            value[1] = 96
+
+        cache.token_to_kv_pool_allocator.free_segment.side_effect = mutate_full_value
+        action = FreeDeviceKV([torch.tensor([8], dtype=torch.int64)])
+
+        with envs.SGLANG_ENABLE_ASYNC_ASSERT.override(True):
+            with self.assertRaisesRegex(
+                AssertionError, "reachable Full value changed after action FreeDeviceKV"
+            ):
+                cache._apply_cache_actions([action])
+
     def test_chained_replace_write_through_requires_list_order(self):
         # A pending node split twice in one walk emits two chained Replaces:
         # the second one's old_node_id only enters the publish list when the
