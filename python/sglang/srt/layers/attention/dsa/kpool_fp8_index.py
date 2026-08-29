@@ -9,6 +9,24 @@ INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
+@torch.inference_mode()
+def precompile_index_prefix_gather(device: torch.device) -> bool:
+    """Compile this module's FP8 index-prefix gather before cache allocation."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+
+    page_size = BLOCK_SIZE_K
+    bytes_per_page = page_size * (INDEX_HEAD_DIM + 4)
+    buf = torch.zeros((1, bytes_per_page), dtype=torch.uint8, device=device)
+    page_indices = torch.zeros((1,), dtype=torch.int32, device=device)
+    k_out = torch.empty((1, INDEX_HEAD_DIM), dtype=torch.uint8, device=device)
+    scale_out = torch.empty((1,), dtype=torch.float32, device=device)
+    pool = type("_PrecompilePool", (), {"page_size": page_size})()
+    gather_index_k_scale_prefix_into(pool, buf, page_indices, 1, k_out, scale_out)
+    return True
+
+
 def kpool_max_closed_pools(num_draft_tokens: int, pool_size: int) -> int:
     """Return the most pools an N-token write can close at any start offset."""
     return (num_draft_tokens + pool_size - 1) // pool_size

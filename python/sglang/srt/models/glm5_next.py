@@ -1329,6 +1329,61 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.config.rope_scaling or {}
         )
 
+    def precompile_kernels_after_loading(self) -> None:
+        """Load GLM's long-prefill kernels before memory pools are committed."""
+        if self.encoder_only or self.model is None:
+            return
+
+        linear_attn = next(
+            (
+                layer.self_attn
+                for layer in self.model.layers
+                if not isinstance(layer, PPMissingLayer)
+                and isinstance(layer.self_attn, Glm5NextLinearAttention)
+            ),
+            None,
+        )
+        if linear_attn is None:
+            return
+
+        from sglang.kernels.ops.attention.fla.kda import (
+            precompile_kda_prefill_kernels,
+        )
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            precompile_index_prefix_gather,
+        )
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            precompile_w4a16_prefill_routes,
+        )
+
+        device = linear_attn.dt_bias.device
+        model_dtype = (
+            getattr(linear_attn.o_proj, "params_dtype", None) or torch.bfloat16
+        )
+        compiled = [
+            precompile_kda_prefill_kernels(
+                num_heads=linear_attn.local_num_heads,
+                key_dim=linear_attn.head_k_dim,
+                value_dim=linear_attn.head_v_dim,
+                dtype=model_dtype,
+                state_dtype=model_dtype,
+                device=device,
+                lower_bound=linear_attn.attn.lower_bound,
+            ),
+            precompile_index_prefix_gather(device),
+            precompile_w4a16_prefill_routes(
+                device=device,
+                num_experts=self.config.n_routed_experts,
+                top_k=self.config.num_experts_per_tok,
+            ),
+        ]
+        if any(compiled):
+            log_info_on_rank0(
+                logger,
+                "Precompiled GLM-5.3 KDA, DSA index, and W4A16 "
+                "long-prefill kernels before memory-pool allocation.",
+            )
+
     def get_input_embeddings(self) -> nn.Embedding:
         if self.model is None:
             raise AttributeError(

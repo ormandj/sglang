@@ -24,27 +24,105 @@ else:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("ieee")
 
 
+# Curated winners avoid retaining every candidate cubin for production shapes.
+# Keys are entirely kernel/device driven so unrelated shapes continue through
+# the generic autotuners.  The sm_120 entries were measured with bf16 KDA at
+# H=32, K=V=128, BT=64, BC=16 on RTX PRO 6000 Blackwell.
+_KDA_INTRA_STATIC_CONFIGS = {
+    ((12, 0), torch.bfloat16, 32, 128, 64, 16): triton.Config(
+        {}, num_warps=1, num_stages=3
+    ),
+}
+_KDA_INTER_STATIC_CONFIGS = {
+    ((12, 0), torch.bfloat16, 32, 128, 128, 64, 16, True, True): triton.Config(
+        {"BK": 32, "BV": 64}, num_warps=2, num_stages=3
+    ),
+    ((12, 0), torch.bfloat16, 32, 128, 0, 64, 16, False, False): triton.Config(
+        {"BK": 32, "BV": 64}, num_warps=1, num_stages=3
+    ),
+}
+
+
+def _get_kda_intra_static_config(
+    tensor: torch.Tensor,
+    *,
+    num_heads: int,
+    key_dim: int,
+    chunk_size: int,
+    sub_chunk_size: int,
+) -> triton.Config | None:
+    if not tensor.is_cuda:
+        return None
+    return _KDA_INTRA_STATIC_CONFIGS.get(
+        (
+            torch.cuda.get_device_capability(tensor.device),
+            tensor.dtype,
+            num_heads,
+            key_dim,
+            chunk_size,
+            sub_chunk_size,
+        )
+    )
+
+
+def _get_kda_inter_static_config(
+    tensor: torch.Tensor,
+    *,
+    num_heads: int,
+    key_dim: int,
+    value_dim: int,
+    chunk_size: int,
+    sub_chunk_size: int,
+    fuse_recompute: bool,
+    fuse_diagonal: bool,
+) -> triton.Config | None:
+    if not tensor.is_cuda:
+        return None
+    return _KDA_INTER_STATIC_CONFIGS.get(
+        (
+            torch.cuda.get_device_capability(tensor.device),
+            tensor.dtype,
+            num_heads,
+            key_dim,
+            value_dim,
+            chunk_size,
+            sub_chunk_size,
+            fuse_recompute,
+            fuse_diagonal,
+        )
+    )
+
+
+def _launch_with_static_config(
+    kernel,
+    static_kernel,
+    grid,
+    config: triton.Config | None,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    **kwargs,
+) -> None:
+    if config is None:
+        kernel[grid](cu_seqlens=cu_seqlens, **kwargs)
+        return
+
+    static_kernel[grid](
+        cu_seqlens=cu_seqlens,
+        IS_VARLEN=cu_seqlens is not None,
+        **kwargs,
+        **config.kwargs,
+        num_warps=config.num_warps,
+        num_stages=config.num_stages,
+    )
+
+
 ################################################################################
 # Fused inter + solve_tril kernel: compute off-diagonal Akk and solve in one pass
 ################################################################################
 
 
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": BK, "BV": 64}, num_warps=num_warps)
-        for BK in [32, 64]
-        for num_warps in [1, 2, 4]
-    ],
-    key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["T"])
-def chunk_kda_fwd_kernel_inter_solve_fused(
+def _chunk_kda_fwd_kernel_inter_solve_fused(
     q,
     k,
     g,
@@ -88,12 +166,14 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -781,22 +861,23 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
         tl.store(p_Akk33, b_Ai33.to(Akk.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-    }
+chunk_kda_fwd_kernel_inter_solve_fused = triton.heuristics(
+    {"IS_VARLEN": lambda args: args["cu_seqlens"] is not None}
+)(
+    triton.autotune(
+        configs=[
+            triton.Config({"BK": BK, "BV": 64}, num_warps=num_warps)
+            for BK in [32, 64]
+            for num_warps in [1, 2, 4]
+        ],
+        key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
+        **autotune_cache_kwargs,
+    )(_chunk_kda_fwd_kernel_inter_solve_fused)
 )
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [1, 2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["BT", "BC"],
-    **autotune_cache_kwargs,
-)
+
+
 @triton.jit(do_not_specialize=["T"])
-def chunk_kda_fwd_kernel_intra_sub_chunk(
+def _chunk_kda_fwd_kernel_intra_sub_chunk(
     q,
     k,
     g,
@@ -819,12 +900,14 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
-        i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(
-            chunk_indices + i_t * 2 + 1
-        ).to(tl.int32)
-        bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(
-            cu_seqlens + i_n + 1
-        ).to(tl.int32)
+        i_n, i_t = (
+            tl.load(chunk_indices + i_t * 2).to(tl.int32),
+            tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32),
+        )
+        bos, eos = (
+            tl.load(cu_seqlens + i_n).to(tl.int32),
+            tl.load(cu_seqlens + i_n + 1).to(tl.int32),
+        )
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -907,6 +990,21 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     tl.store(p_Akk, b_Ai.to(Akk.dtype.element_ty), boundary_check=(0, 1))
 
 
+chunk_kda_fwd_kernel_intra_sub_chunk = triton.heuristics(
+    {"IS_VARLEN": lambda args: args["cu_seqlens"] is not None}
+)(
+    triton.autotune(
+        configs=[
+            triton.Config({}, num_warps=num_warps, num_stages=num_stages)
+            for num_warps in [1, 2, 4, 8]
+            for num_stages in [2, 3, 4]
+        ],
+        key=["BT", "BC"],
+        **autotune_cache_kwargs,
+    )(_chunk_kda_fwd_kernel_intra_sub_chunk)
+)
+
+
 def chunk_kda_fwd_intra(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -942,7 +1040,18 @@ def chunk_kda_fwd_intra(
         if safe_gate:
             grid = (NT, NC, B * H)
             BK = triton.next_power_of_2(K)
-            chunk_kda_fwd_kernel_intra_sub_chunk[grid](
+            static_config = _get_kda_intra_static_config(
+                q,
+                num_heads=H,
+                key_dim=K,
+                chunk_size=BT,
+                sub_chunk_size=BC,
+            )
+            _launch_with_static_config(
+                chunk_kda_fwd_kernel_intra_sub_chunk,
+                _chunk_kda_fwd_kernel_intra_sub_chunk,
+                grid,
+                static_config,
                 q=q,
                 k=k,
                 g=gk,
@@ -981,7 +1090,21 @@ def chunk_kda_fwd_intra(
         w = torch.empty_like(k)
         u = torch.empty_like(v)
         kg = torch.empty_like(k)
-        chunk_kda_fwd_kernel_inter_solve_fused[grid](
+        static_config = _get_kda_inter_static_config(
+            q,
+            num_heads=H,
+            key_dim=K,
+            value_dim=V,
+            chunk_size=BT,
+            sub_chunk_size=BC,
+            fuse_recompute=True,
+            fuse_diagonal=fuse_diagonal,
+        )
+        _launch_with_static_config(
+            chunk_kda_fwd_kernel_inter_solve_fused,
+            _chunk_kda_fwd_kernel_inter_solve_fused,
+            grid,
+            static_config,
             q=q,
             k=k,
             g=gk,
@@ -1010,7 +1133,21 @@ def chunk_kda_fwd_intra(
 
     # Non-fused path: inter_solve stores Akk, then separate recompute
     Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
-    chunk_kda_fwd_kernel_inter_solve_fused[grid](
+    static_config = _get_kda_inter_static_config(
+        q,
+        num_heads=H,
+        key_dim=K,
+        value_dim=0,
+        chunk_size=BT,
+        sub_chunk_size=BC,
+        fuse_recompute=False,
+        fuse_diagonal=fuse_diagonal,
+    )
+    _launch_with_static_config(
+        chunk_kda_fwd_kernel_inter_solve_fused,
+        _chunk_kda_fwd_kernel_inter_solve_fused,
+        grid,
+        static_config,
         q=q,
         k=k,
         g=gk,
@@ -1051,3 +1188,83 @@ def chunk_kda_fwd_intra(
         chunk_indices=chunk_indices,
     )
     return w, u, None, kg, Aqk, Akk
+
+
+@torch.inference_mode()
+def precompile_kda_prefill_static_kernels(
+    *,
+    num_heads: int,
+    key_dim: int,
+    value_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    """Compile available curated KDA shapes before cache allocation."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return False
+
+    capability = torch.cuda.get_device_capability(device)
+    intra_key = (capability, dtype, num_heads, key_dim, 64, 16)
+    fused_inter_key = (
+        capability,
+        dtype,
+        num_heads,
+        key_dim,
+        value_dim,
+        64,
+        16,
+        True,
+        True,
+    )
+    unfused_inter_key = (
+        capability,
+        dtype,
+        num_heads,
+        key_dim,
+        0,
+        64,
+        16,
+        False,
+        False,
+    )
+    if (
+        intra_key not in _KDA_INTRA_STATIC_CONFIGS
+        or fused_inter_key not in _KDA_INTER_STATIC_CONFIGS
+        or unfused_inter_key not in _KDA_INTER_STATIC_CONFIGS
+    ):
+        return False
+
+    shape = (1, 1, num_heads, key_dim)
+    q = torch.zeros(shape, dtype=dtype, device=device)
+    k = torch.zeros_like(q)
+    v = torch.zeros((1, 1, num_heads, value_dim), dtype=dtype, device=device)
+    gk = torch.zeros(shape, dtype=torch.float32, device=device)
+    beta = torch.zeros((1, 1, num_heads), dtype=dtype, device=device)
+    cu_seqlens = torch.tensor([0, 1], dtype=torch.int64, device=device)
+
+    chunk_kda_fwd_intra(
+        q,
+        k,
+        v,
+        gk=gk,
+        beta=beta,
+        scale=key_dim**-0.5,
+        cu_seqlens=cu_seqlens,
+        safe_gate=True,
+        fuse_recompute=True,
+        fuse_diagonal=True,
+    )
+    chunk_kda_fwd_intra(
+        q,
+        k,
+        v,
+        gk=gk,
+        beta=beta,
+        scale=key_dim**-0.5,
+        cu_seqlens=cu_seqlens,
+        safe_gate=True,
+        fuse_recompute=False,
+        fuse_diagonal=False,
+    )
+    return True

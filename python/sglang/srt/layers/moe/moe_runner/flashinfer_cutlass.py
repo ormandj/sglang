@@ -64,6 +64,34 @@ class FlashInferCutlassMoeQuantInfo(MoeQuantInfo):
     prepared_weights: Optional[Any] = None
 
 
+@torch.inference_mode()
+def precompile_w4a16_prefill_routes(
+    *, device: torch.device, num_experts: int, top_k: int, prefill_tokens: int = 8192
+) -> bool:
+    """Compile the selected large-prefill route pack before cache allocation."""
+    device = torch.device(device)
+    if (
+        device.type != "cuda"
+        or torch.cuda.get_device_capability(device) != (12, 0)
+        or num_experts <= 0
+        or top_k <= 0
+        or prefill_tokens <= 0
+    ):
+        return False
+
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+        select_route_block_size_m,
+    )
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_route_pack import (
+        pack_topk_routes_by_expert,
+    )
+
+    topk_ids = torch.zeros((prefill_tokens, top_k), dtype=torch.int32, device=device)
+    block_size = select_route_block_size_m(prefill_tokens, top_k, num_experts)
+    pack_topk_routes_by_expert(topk_ids, block_size, num_experts)
+    return True
+
+
 def _run_flashinfer_b12x_w4a16(
     *,
     dispatch_output,
@@ -108,9 +136,7 @@ def _run_flashinfer_b12x_w4a16(
         launch_sm120_moe,
     )
 
-    w13_scale, w13_global_scale, w2_scale, w2_global_scale = (
-        quant_info.quant_scales
-    )
+    w13_scale, w13_global_scale, w2_scale, w2_global_scale = quant_info.quant_scales
     return launch_sm120_moe(
         a=x,
         w1_weight=quant_info.w13_weight,

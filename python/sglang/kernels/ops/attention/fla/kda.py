@@ -13,7 +13,10 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from sglang.kernels.ops.attention.fla.chunk_intra import chunk_kda_fwd_intra
+from sglang.kernels.ops.attention.fla.chunk_intra import (
+    chunk_kda_fwd_intra,
+    precompile_kda_prefill_static_kernels,
+)
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_norm_gate import layer_norm_gated_fwd
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
@@ -651,9 +654,13 @@ recompute_w_u_fwd_kernel = triton.autotune(
     **autotune_cache_kwargs,
 )(_recompute_w_u_fwd_kernel)
 
-_K3_RECOMPUTE_W_U_CONFIGS = {
+_STATIC_RECOMPUTE_W_U_CONFIGS = {
     (9, 0): {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 2},
     (10, 3): {"BK": 64, "BV": 128, "num_warps": 8, "num_stages": 2},
+    # BF16 H=32, K=V=128, BT=64, varlen prefill. Measured winner on RTX PRO
+    # 6000 Blackwell. Avoid loading all 36 autotune candidates after a server
+    # has already committed its memory pools.
+    (12, 0): {"BK": 128, "BV": 128, "num_warps": 8, "num_stages": 3},
 }
 
 
@@ -665,7 +672,7 @@ def precompile_k3_recompute_w_u_kernel(
     if (
         not is_nvidia
         or device.type != "cuda"
-        or torch.cuda.get_device_capability(device) not in _K3_RECOMPUTE_W_U_CONFIGS
+        or torch.cuda.get_device_capability(device) not in _STATIC_RECOMPUTE_W_U_CONFIGS
     ):
         return False
 
@@ -680,7 +687,7 @@ def precompile_k3_recompute_w_u_kernel(
     return True
 
 
-def _get_k3_recompute_w_u_config(
+def _get_static_recompute_w_u_config(
     k: torch.Tensor,
     gk: torch.Tensor | None,
     cu_seqlens: torch.LongTensor | None,
@@ -695,7 +702,7 @@ def _get_k3_recompute_w_u_config(
         or (K, V, BT) != (128, 128, 64)
     ):
         return None
-    return _K3_RECOMPUTE_W_U_CONFIGS.get(torch.cuda.get_device_capability(k.device))
+    return _STATIC_RECOMPUTE_W_U_CONFIGS.get(torch.cuda.get_device_capability(k.device))
 
 
 def recompute_w_u_fwd(
@@ -717,7 +724,7 @@ def recompute_w_u_fwd(
     w = torch.empty_like(k)
     u = torch.empty_like(v)
     kg = torch.empty_like(k) if gk is not None else None
-    static_config = _get_k3_recompute_w_u_config(k, gk, cu_seqlens, K, V, BT)
+    static_config = _get_static_recompute_w_u_config(k, gk, cu_seqlens, K, V, BT)
     kernel = (
         _recompute_w_u_fwd_kernel
         if static_config is not None
@@ -1239,3 +1246,72 @@ def chunk_kda(
         lower_bound=lower_bound,
         output_intermediate_states=output_intermediate_states,
     )
+
+
+@torch.inference_mode()
+def precompile_kda_prefill_kernels(
+    *,
+    num_heads: int,
+    key_dim: int,
+    value_dim: int,
+    dtype: torch.dtype,
+    state_dtype: torch.dtype,
+    device: torch.device,
+    lower_bound: float | None,
+    long_prefill_tokens: int = 2112,
+) -> bool:
+    """Compile curated short- and long-prefill KDA paths before pool sizing.
+
+    The helper is deliberately shape driven. Unsupported devices or geometries
+    retain the ordinary autotuned path and return ``False`` without compiling.
+    ``long_prefill_tokens`` defaults to 33 chunks: the smallest input that
+    exercises the large-grid path and the second recurrent-state chunk bucket.
+    """
+    device = torch.device(device)
+    if not precompile_kda_prefill_static_kernels(
+        num_heads=num_heads,
+        key_dim=key_dim,
+        value_dim=value_dim,
+        dtype=dtype,
+        device=device,
+    ):
+        return False
+    if long_prefill_tokens <= 32 * 64:
+        raise ValueError("long_prefill_tokens must exercise more than 32 chunks")
+
+    for num_tokens in (1, long_prefill_tokens):
+        shape = (1, num_tokens, num_heads, key_dim)
+        q = torch.zeros(shape, dtype=dtype, device=device)
+        k = torch.zeros_like(q)
+        v = torch.zeros(
+            (1, num_tokens, num_heads, value_dim), dtype=dtype, device=device
+        )
+        g = torch.zeros_like(k)
+        beta = torch.zeros((1, num_tokens, num_heads), dtype=dtype, device=device)
+        initial_state = torch.zeros(
+            (1, num_heads, value_dim, key_dim),
+            dtype=state_dtype,
+            device=device,
+        )
+        initial_state_indices = torch.zeros((1,), dtype=torch.int32, device=device)
+        cu_seqlens = torch.tensor([0, num_tokens], dtype=torch.int32, device=device)
+        A_log = torch.zeros((1, 1, num_heads, 1), dtype=torch.float32, device=device)
+        dt_bias = torch.zeros(
+            (num_heads * key_dim,), dtype=torch.float32, device=device
+        )
+        chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=True,
+        )
+    return True
