@@ -35,6 +35,7 @@ from sglang.srt.utils import (
     is_hip,
     next_power_of_2,
 )
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 _is_hip = is_hip()
 
@@ -179,6 +180,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
     ):
+        # Keep the three inputs to alloc_extend_kernel independently attributable
+        # under the legacy async-assert diagnostic. A negative output can come
+        # from a stale prefix tail, a poisoned free-page list, or an incomplete
+        # kernel store; checking only the eventual KV write cannot distinguish
+        # those cases.
+        maybe_detect_oob(
+            last_loc[prefix_lens > 0],
+            1,
+            self.size + self.page_size,
+            "PagedTokenToKVPoolAllocator.alloc_extend last_loc",
+        )
+        maybe_detect_oob(
+            self.free_pages,
+            1,
+            self.num_pages + 1,
+            "PagedTokenToKVPoolAllocator.alloc_extend free_pages",
+        )
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size
@@ -202,6 +220,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             out_indices,
             next_power_of_2(bs),
             self.page_size,
+        )
+        maybe_detect_oob(
+            out_indices,
+            1,
+            self.size + self.page_size,
+            "PagedTokenToKVPoolAllocator.alloc_extend output",
         )
 
         if self.debug_mode:
@@ -262,6 +286,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.numel() == 0:
             return
 
+        maybe_detect_oob(
+            free_index,
+            1,
+            self.size + self.page_size,
+            "PagedTokenToKVPoolAllocator.free input",
+        )
+
         if self.free_group is None:
             self._release_page_ids(torch.unique(free_index // self.page_size))
         else:
@@ -277,6 +308,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         Contract: see base; a page must be freed by only one call per group."""
         if free_index.numel() == 0:
             return
+
+        maybe_detect_oob(
+            free_index,
+            1,
+            self.size + self.page_size,
+            "PagedTokenToKVPoolAllocator.free_segment input",
+        )
 
         ps = self.page_size
         offset = start_pos % ps
