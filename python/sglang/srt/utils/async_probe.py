@@ -155,6 +155,37 @@ def maybe_detect_oob(indices: Optional[torch.Tensor], low: int, high: int, msg: 
     )
 
 
+def maybe_sync_detect_oob(
+    indices: Optional[torch.Tensor], low: int, high: int, msg: str
+) -> None:
+    """Diagnostic-only synchronous index check with exact offending values.
+
+    This is intentionally gated by the same legacy async-assert switch and is
+    suitable only at low-frequency lifecycle boundaries. Unlike
+    :func:`maybe_detect_oob`, it names the exact boundary immediately instead
+    of surfacing at a later CUDA synchronization point.
+    """
+    if not envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        return
+    if indices is None or indices.numel() == 0:
+        return
+
+    flat = indices.reshape(-1)
+    minimum = int(flat.min().item())
+    maximum = int(flat.max().item())
+    invalid = (flat < low) | (flat >= high)
+    if not bool(invalid.any().item()):
+        return
+
+    positions = torch.nonzero(invalid, as_tuple=False).reshape(-1)[:8]
+    values = flat[positions].detach().cpu().tolist()
+    raise AssertionError(
+        f"index outside [{low}, {high}) at {msg}: "
+        f"dtype={flat.dtype} numel={flat.numel()} min={minimum} max={maximum} "
+        f"positions={positions.detach().cpu().tolist()} values={values}"
+    )
+
+
 def maybe_detect_page_aligned(
     indices: Optional[torch.Tensor], page_size: int, msg: str
 ):

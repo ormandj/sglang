@@ -24,7 +24,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     EvictLayer,
     TreeComponent,
 )
-from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.async_probe import maybe_detect_oob, maybe_sync_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -146,6 +146,12 @@ class FullComponent(TreeComponent):
         assert new_parent.component_data[ct].session_ids is None
         split_len = len(new_parent.key)
         if child_cd.value is not None:
+            maybe_sync_detect_oob(
+                child_cd.value,
+                1,
+                self.cache.token_to_kv_pool_allocator.size + self.cache.page_size,
+                "FullComponent.redistribute_on_node_split source",
+            )
             maybe_detect_oob(
                 child_cd.value,
                 1,
@@ -154,6 +160,18 @@ class FullComponent(TreeComponent):
             )
             new_parent.component_data[ct].value = child_cd.value[:split_len].clone()
             child_cd.value = child_cd.value[split_len:].clone()
+            maybe_sync_detect_oob(
+                new_parent.component_data[ct].value,
+                1,
+                self.cache.token_to_kv_pool_allocator.size + self.cache.page_size,
+                "FullComponent.redistribute_on_node_split parent",
+            )
+            maybe_sync_detect_oob(
+                child_cd.value,
+                1,
+                self.cache.token_to_kv_pool_allocator.size + self.cache.page_size,
+                "FullComponent.redistribute_on_node_split child",
+            )
             maybe_detect_oob(
                 new_parent.component_data[ct].value,
                 1,
@@ -185,6 +203,12 @@ class FullComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
+            maybe_sync_detect_oob(
+                cd.value,
+                1,
+                self.cache.token_to_kv_pool_allocator.size + self.cache.page_size,
+                "FullComponent.evict_component value",
+            )
             maybe_detect_oob(
                 cd.value,
                 1,

@@ -84,7 +84,7 @@ from sglang.srt.observability.metrics_collector import (
 )
 from sglang.srt.runtime_context import get_memory, get_observability
 from sglang.srt.session.streaming_session import StreamingSession
-from sglang.srt.utils.async_probe import maybe_detect_oob
+from sglang.srt.utils.async_probe import maybe_detect_oob, maybe_sync_detect_oob
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -507,12 +507,26 @@ class UnifiedRadixCache(BasePrefixCache):
             return result
         if self.disable:
             return self.tree_core.empty_match_result
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            maybe_sync_detect_oob(
+                self.tree_core.all_values_flatten(),
+                1,
+                self.token_to_kv_pool_allocator.size + self.page_size,
+                "UnifiedRadixCache.match_prefix pre-walk tree",
+            )
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
         self._apply_cache_actions(result.cache_actions)
         for component in self._components_tuple:
             result = component.finalize_match_result_in_cache(params, result)
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            maybe_sync_detect_oob(
+                self.tree_core.all_values_flatten(),
+                1,
+                self.token_to_kv_pool_allocator.size + self.page_size,
+                "UnifiedRadixCache.match_prefix post-walk tree",
+            )
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
         return result
@@ -533,6 +547,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+                        maybe_sync_detect_oob(
+                            self.tree_core.all_values_flatten(),
+                            1,
+                            self.token_to_kv_pool_allocator.size + self.page_size,
+                            "UnifiedRadixCache.insert completed tree",
+                        )
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -886,6 +907,12 @@ class UnifiedRadixCache(BasePrefixCache):
                     len(req.output_ids),
                     req.finished_len,
                 )
+            maybe_sync_detect_oob(
+                values,
+                1,
+                self.token_to_kv_pool_allocator.size + self.page_size,
+                "UnifiedRadixCache.cache_finished_req insert values",
+            )
             maybe_detect_oob(
                 values,
                 1,
@@ -1002,6 +1029,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 req.kv.kv_allocated_len,
                 req.kv_committed_len,
             )
+        maybe_sync_detect_oob(
+            values,
+            1,
+            self.token_to_kv_pool_allocator.size + self.page_size,
+            "UnifiedRadixCache.cache_unfinished_req insert values",
+        )
         maybe_detect_oob(
             values,
             1,

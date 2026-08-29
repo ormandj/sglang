@@ -79,6 +79,7 @@ from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
     split_node_hash_value,
 )
+from sglang.srt.utils.async_probe import maybe_sync_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -1140,6 +1141,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.parent = parent
         new_node.key = key
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
+        maybe_sync_detect_oob(
+            new_node.component_data[BASE_COMPONENT_TYPE].value,
+            1,
+            self.components_by_type[
+                BASE_COMPONENT_TYPE
+            ].cache.token_to_kv_pool_allocator.size
+            + self.page_size,
+            "UnifiedTreeCore._add_new_node value",
+        )
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
         if self.enable_storage:
@@ -1160,6 +1170,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert cd.value is None
         n = len(fresh_value)
         cd.value = fresh_value.clone()
+        maybe_sync_detect_oob(
+            cd.value,
+            1,
+            self.components_by_type[
+                BASE_COMPONENT_TYPE
+            ].cache.token_to_kv_pool_allocator.size
+            + self.page_size,
+            "UnifiedTreeCore._unevict_node_on_insert value",
+        )
         self.component_evictable_size_[ct] += n
         self._update_evictable_leaf_sets(node)
         # A backuped node restored from fresh KV is a duplicate right away.
