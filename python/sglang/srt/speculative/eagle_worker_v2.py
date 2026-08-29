@@ -187,6 +187,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        # The draft loader creates embedding/head placeholders even though the
+        # serving path aliases the target tensors. Release and rebind them as
+        # soon as draft loading finishes so memory-pool sizing observes the
+        # real steady model footprint rather than the temporary placeholders.
+        self.init_token_map()
+        self.init_lm_head()
         self._init_dsa_index_share_state()
         # Eager draft-extend seed buffer (graph paths use their own static ones).
         self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
@@ -333,6 +339,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        if getattr(self, "_embed_and_head_shared", False):
+            return
+
         from sglang.srt.lora.layers import unwrap_lora_layer
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
@@ -376,6 +385,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # Share the embedding and lm_head
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
+
+        self._embed_and_head_shared = True
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
