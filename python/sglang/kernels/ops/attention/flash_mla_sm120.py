@@ -641,8 +641,12 @@ def flashinfer_sparse_mla_forward(
             "flashinfer_sparse_mla does not support skip-softmax thresholds"
         )
 
+    # GLM-5.3's configured qk_nope_head_dim is 256, while the absorbed query
+    # presented to sparse MLA is 512 wide. Detect the native kernel contract
+    # from that actual tensor/layout geometry; checking the pre-absorption
+    # config dimension silently skipped the required 2051 -> 2176 padding.
     is_glm53_nope = (
-        qk_nope_head_dim == 512
+        q.shape[-1] == 512
         and kv_lora_rank == 512
         and qk_rope_head_dim == 0
         and kv_cache_dim == _GLM53_NOPE_FLASHINFER_KV_DIM

@@ -42,7 +42,9 @@ class TestFlashInferSparseMLAAdapter(unittest.TestCase):
             runner=FakeRunner(),
             page_size=64,
             kv_cache_dim=656,
-            qk_nope_head_dim=512,
+            # This is the checkpoint's pre-absorption dimension. The query
+            # reaching the native sparse-MLA kernel is 512 wide.
+            qk_nope_head_dim=256,
             kv_lora_rank=512,
             qk_rope_head_dim=0,
             sm_scale=0.125,
