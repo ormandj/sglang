@@ -318,6 +318,11 @@ class HiCacheController:
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        # Token granularity of one storage (L3) key. Defaults to the host pool
+        # page size; UnifiedRadixCache.init_hicache raises it to the radix-tree
+        # page size for compressed-DSA pools, where one tree page (the hash
+        # unit) spans multiple physical host pages ("span mode").
+        self.storage_page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
         self.storage_backend = None
@@ -1016,9 +1021,8 @@ class HiCacheController:
     def _generic_page_get(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
-        dummy_page_dst = [
-            self.storage_host_pool.get_dummy_flat_data_page() for _ in hash_values
-        ]
+        pages_per_key = self.storage_page_size // self.page_size
+        dummy_page_dst = [self._span_dummy_page(pages_per_key) for _ in hash_values]
         page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
         if page_data is None:
             return 0
@@ -1031,12 +1035,35 @@ class HiCacheController:
                 break
             if operation.is_terminated():
                 break
-            self.storage_host_pool.set_from_flat_data_page(
-                host_indices[i * self.page_size],
+            self._restore_span_page(
+                host_indices[
+                    i * self.storage_page_size : (i + 1) * self.storage_page_size
+                ],
                 page_data[i],
+                pages_per_key,
             )
             count += 1
         return count
+
+    def _span_dummy_page(self, pages_per_key: int) -> torch.Tensor:
+        if pages_per_key == 1:
+            return self.storage_host_pool.get_dummy_flat_data_page()
+        return torch.cat(
+            [
+                self.storage_host_pool.get_dummy_flat_data_page()
+                for _ in range(pages_per_key)
+            ]
+        )
+
+    def _restore_span_page(
+        self, slots: torch.Tensor, data: torch.Tensor, pages_per_key: int
+    ) -> None:
+        page_numel = data.numel() // pages_per_key
+        for j in range(pages_per_key):
+            self.storage_host_pool.set_from_flat_data_page(
+                int(slots[j * self.page_size]),
+                data[j * page_numel : (j + 1) * page_numel],
+            )
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
@@ -1057,7 +1084,8 @@ class HiCacheController:
             if all_success:
                 batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
                 batch_host_indices = operation.host_indices[
-                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                    i * self.storage_page_size : (i + len(batch_hashes))
+                    * self.storage_page_size
                 ]
 
                 # Get one batch token, and update the completed_tokens if succeed
@@ -1078,7 +1106,7 @@ class HiCacheController:
                 completed_pages += hit_pages
             ack = PrefetchAck(
                 rid=operation.request_id,
-                completed_tokens=completed_pages * self.page_size,
+                completed_tokens=completed_pages * self.storage_page_size,
                 operation=operation,
             )
             self.prefetch_sync_queue.put(ack)
@@ -1172,7 +1200,7 @@ class HiCacheController:
         storage_query_count = 0
         hash_value = []
         page_hashes = self.get_hash_str(
-            tokens_to_fetch, last_hash, page_size=self.page_size
+            tokens_to_fetch, last_hash, page_size=self.storage_page_size
         )
         operation.all_hash_values = page_hashes
 
@@ -1181,7 +1209,7 @@ class HiCacheController:
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
             hash_value.extend(batch_hashes[:hit_page_num])
-            storage_query_count += hit_page_num * self.page_size
+            storage_query_count += hit_page_num * self.storage_page_size
             if hit_page_num < len(batch_hashes):
                 break
             if prefix_keys and len(prefix_keys) > 0:
@@ -1215,7 +1243,7 @@ class HiCacheController:
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
                 operation.hash_value = hash_value[
-                    : (storage_hit_count // self.page_size)
+                    : (storage_hit_count // self.storage_page_size)
                 ]
                 operation.storage_hit_count = storage_hit_count
                 self.prefetch_hit_queue.put(operation)
@@ -1241,10 +1269,13 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
-        data = [
-            self.storage_host_pool.get_data_page(host_indices[i * self.page_size])
-            for i in range(len(hash_values))
-        ]
+        span = self.storage_page_size
+        pages_per_key = span // self.page_size
+        data = []
+        for i in range(len(hash_values)):
+            first_slots = host_indices[i * span : (i + 1) * span][:: self.page_size]
+            pages = [self.storage_host_pool.get_data_page(int(s)) for s in first_slots]
+            data.append(pages[0] if pages_per_key == 1 else torch.cat(pages))
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
@@ -1259,7 +1290,8 @@ class HiCacheController:
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
-                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+                i * self.storage_page_size : (i + len(batch_hashes))
+                * self.storage_page_size
             ]
             # Set one batch token, and record if success.
             # todo: allow partial success
@@ -1273,7 +1305,7 @@ class HiCacheController:
 
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
-            operation.completed_tokens += self.page_size * len(batch_hashes)
+            operation.completed_tokens += self.storage_page_size * len(batch_hashes)
 
     def backup_thread_func(self):
         """

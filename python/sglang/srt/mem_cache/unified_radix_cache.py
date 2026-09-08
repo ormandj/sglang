@@ -433,11 +433,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Parse storage config once, share with assembler and tree
         storage_backend = get_memory().hicache_storage_backend
+        storage_page_size = None
         if storage_backend is not None and self.page_size != params.page_size:
-            raise ValueError(
-                "Compressed DSA currently supports L2 HiCache only; "
-                "storage hashes and transfers require matching page sizes."
+            from sglang.srt.mem_cache.storage.backend_factory import (
+                StorageBackendFactory,
             )
+
+            if not StorageBackendFactory.backend_supports_page_spans(storage_backend):
+                raise ValueError(
+                    "Compressed DSA currently supports L2 HiCache only; "
+                    "storage hashes and transfers require matching page sizes."
+                )
+            # Span-capable storage: keep the radix-tree page as the storage
+            # hash granularity and store each tree page as one multi-page
+            # object (one key -> storage_page_size / pool.page_size pages).
+            storage_page_size = self.page_size
         storage_extra_config = None
         storage_prefetch_threshold = 256
         prefetch_timeout_base = 1.0
@@ -463,6 +473,8 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_extra_config=storage_extra_config,
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
+        if storage_page_size is not None and self.cache_controller is not None:
+            self.cache_controller.storage_page_size = storage_page_size
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
             self.tree_core.set_hicache_enabled()
@@ -2764,7 +2776,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 "--enable-hierarchical-cache to attach a storage backend.",
             )
         if self.page_size != self.cache_controller.page_size:
-            return False, "Compressed DSA currently supports L2 HiCache only."
+            from sglang.srt.mem_cache.storage.backend_factory import (
+                StorageBackendFactory,
+            )
+
+            if not StorageBackendFactory.backend_supports_page_spans(storage_backend):
+                return False, (
+                    "Compressed DSA currently supports L2 HiCache only; "
+                    "a span-capable storage backend (e.g. file) is required for "
+                    "the multi-page storage object layout."
+                )
+            self.cache_controller.storage_page_size = self.page_size
         return self._storage_attachment.attach(
             storage_backend=storage_backend,
             storage_backend_extra_config_json=storage_backend_extra_config_json,
