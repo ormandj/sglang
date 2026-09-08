@@ -3788,33 +3788,32 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        skip_waiting_admission = False
-        if self.chunked_req is not None:
+        resumed_chunk = self.chunked_req is not None
+        if resumed_chunk:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
-            post_chunk_budget_state = adder.budget_state()
-            # NO_TOKEN takes precedence over chunk exhaustion in budget_state().
-            chunk_budget_exhausted = (
-                self.dllm_config is None
-                and adder.rem_chunk_tokens is not None
-                and adder.rem_chunk_tokens <= 0
-            )
-            skip_waiting_admission = (
-                post_chunk_budget_state == AddReqResult.OTHER or chunk_budget_exhausted
-            )
+
+        # Mixed decode can leave less than one page even without a resumed chunk.
+        post_chunk_budget_state = adder.budget_state()
+        # NO_TOKEN takes precedence over chunk exhaustion in budget_state().
+        chunk_budget_exhausted = (
+            self.dllm_config is None
+            and adder.rem_chunk_tokens is not None
+            and adder.rem_chunk_tokens < adder.page_size
+        )
+        skip_waiting_admission = (
+            resumed_chunk and post_chunk_budget_state == AddReqResult.OTHER
+        ) or chunk_budget_exhausted
+        if skip_waiting_admission and post_chunk_budget_state == AddReqResult.NO_TOKEN:
             if (
-                skip_waiting_admission
-                and post_chunk_budget_state == AddReqResult.NO_TOKEN
+                self.enable_hierarchical_cache
+                or self.enable_unified_cache_external_linker
             ):
-                if (
-                    self.enable_hierarchical_cache
-                    or self.enable_unified_cache_external_linker
-                ):
-                    running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                        not running_batch.is_empty()
-                    )
-                else:
-                    running_batch.batch_is_full = True
+                running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
+                    not running_batch.is_empty()
+                )
+            else:
+                running_batch.batch_is_full = True
 
         if self.enable_lora:
             running_loras = {
