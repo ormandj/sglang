@@ -31,6 +31,7 @@ PAGES_PER_KEY = STORAGE_PAGE_SIZE // PAGE_SIZE
 DIM = 3
 LAYER_NUM = 2
 PAGE_NUMEL = LAYER_NUM * PAGE_SIZE * DIM
+STATE_NUMEL = 7
 
 
 class FakeSpanHostPool:
@@ -52,6 +53,24 @@ class FakeSpanHostPool:
         self.kv_buffer[:, index : index + PAGE_SIZE, :, :] = data_page.reshape(
             LAYER_NUM, PAGE_SIZE, 1, DIM
         )
+
+
+class FakeStatePool:
+    """Mamba-like state pool: one fixed-size state slot per key."""
+
+    page_size = 1
+
+    def __init__(self, num_slots: int):
+        self.states = torch.zeros(num_slots, STATE_NUMEL)
+
+    def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        return self.states[index].clone()
+
+    def get_dummy_flat_data_page(self) -> torch.Tensor:
+        return torch.zeros(STATE_NUMEL)
+
+    def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        self.states[index] = data_page
 
 
 @pytest.fixture
@@ -138,6 +157,41 @@ def test_hash_chain_alignment():
     assert isinstance(hashes, list) and len(hashes) == 2
     tail = get_hash_str(tokens[256:], hashes[0], page_size=256)
     assert tail == [hashes[1]]
+
+
+def test_mixed_kv_and_state_pool_roundtrip(span_setup):
+    """KV carries span slots per key; state pools carry one entry per key.
+
+    Regression: _batch_io_v2 used to demand the KV span stride from every
+    pool, so mamba-style one-slot-per-key transfers were rejected and their
+    storage objects never written.
+    """
+    backend, kv_pool = span_setup
+    state_pool = FakeStatePool(num_slots=8)
+    backend.register_mem_host_pool_v2(state_pool, PoolName.MAMBA)
+    keys = ["h0", "h1"]
+    kv_indices = torch.cat([_key_slots(0), _key_slots(1)])
+    state_indices = torch.tensor([3, 5])
+    transfers = [
+        PoolTransfer(name=PoolName.KV, host_indices=kv_indices, keys=keys),
+        PoolTransfer(name=PoolName.MAMBA, host_indices=state_indices, keys=keys),
+    ]
+
+    _fill_pages(kv_pool, 0, 10.0)
+    _fill_pages(kv_pool, 1, 20.0)
+    state_pool.states[3] = 111.0
+    state_pool.states[5] = 222.0
+    res = backend.batch_set_v2(transfers)
+    assert all(res[PoolName.KV]) and all(res[PoolName.MAMBA])
+
+    kv_pool.kv_buffer.zero_()
+    state_pool.states.zero_()
+    res = backend.batch_get_v2(transfers)
+    assert all(res[PoolName.KV]) and all(res[PoolName.MAMBA])
+    _assert_pages(kv_pool, 0, 10.0)
+    _assert_pages(kv_pool, 1, 20.0)
+    assert torch.all(state_pool.states[3] == 111.0)
+    assert torch.all(state_pool.states[5] == 222.0)
 
 
 def test_backend_supports_page_spans():
