@@ -712,18 +712,30 @@ class HiCacheFile(HiCacheStorage):
             host_pool = self.registered_pools[transfer.name]
             keys = transfer.keys or []
             pool_page = getattr(host_pool, "page_size", 1) or 1
-            # Span mode: one key covers storage_page_size tokens (multiple
-            # consecutive host pages); otherwise one key == one host page.
+            # Span mode: KV and KV-derived pools carry storage_page_size token
+            # slots per key (multiple consecutive host pages). Independent
+            # state pools (e.g. mamba) carry their own per-key entry count —
+            # one checkpoint slot per tree page — so the stride is derived
+            # from the transfer instead of assumed.
             span = self.storage_page_size or pool_page
-            expected = len(keys) * span
             host_indices = transfer.host_indices
-
-            if host_indices is None or host_indices.numel() != expected:
+            kv_derived = (
+                transfer.name == PoolName.KV
+                or transfer.indices_from_pool == PoolName.KV
+            )
+            per_key = None
+            if host_indices is not None and keys:
+                per_key = host_indices.numel() // len(keys)
+                if per_key < 1 or host_indices.numel() != per_key * len(keys) or (
+                    kv_derived and per_key != span
+                ):
+                    per_key = None
+            if per_key is None:
                 logger.error(
-                    "%s indices length mismatch for %s: expected %s, got %s",
+                    "%s indices length mismatch for %s: expected %s per key, got %s",
                     op_fn.__name__,
                     transfer.name,
-                    expected,
+                    span if kv_derived else "len(keys)-divisible",
                     host_indices.numel() if host_indices is not None else 0,
                 )
                 results[transfer.name] = [False] * len(keys)
@@ -734,7 +746,7 @@ class HiCacheFile(HiCacheStorage):
                     transfer.name,
                     key,
                     host_pool,
-                    host_indices[i * span : (i + 1) * span],
+                    host_indices[i * per_key : (i + 1) * per_key],
                     pool_page,
                 )
                 for i, key in enumerate(keys)
