@@ -475,6 +475,12 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         if storage_page_size is not None and self.cache_controller is not None:
             self.cache_controller.storage_page_size = storage_page_size
+            # The hybrid stack attaches the startup backend inside the
+            # controller constructor, before this injection point; patch the
+            # live backend instance too so span IO matches immediately.
+            backend = self.cache_controller.storage_backend
+            if backend is not None:
+                backend.storage_page_size = storage_page_size
         # Tag HiCache enablement on the TreeCore.
         if self.cache_controller is not None:
             self.tree_core.set_hicache_enabled()

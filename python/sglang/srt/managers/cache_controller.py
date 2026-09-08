@@ -741,6 +741,7 @@ class HiCacheController:
             model_name=model_name,
             tp_lcm_size=tp_lcm_size,
             should_split_heads=should_split_heads,
+            storage_page_size=self.storage_page_size,
             extra_config=storage_backend_extra_config,
         )
 
