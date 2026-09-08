@@ -7,6 +7,12 @@ Compressed-DSA pools inflate the radix-tree page so one compressed index row
 stays atomic; in span mode one storage key covers K consecutive host pages.
 """
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+import sys
+
 import pytest
 import torch
 
@@ -96,10 +102,10 @@ def test_span_roundtrip(span_setup):
 
     _fill_pages(pool, 0, 10.0)
     _fill_pages(pool, 1, 20.0)
-    assert all(backend.batch_set_v2(transfers)["KV"])
+    assert all(backend.batch_set_v2(transfers)[PoolName.KV])
 
     pool.kv_buffer.zero_()
-    assert all(backend.batch_get_v2(transfers)["KV"])
+    assert all(backend.batch_get_v2(transfers)[PoolName.KV])
     _assert_pages(pool, 0, 10.0)
     _assert_pages(pool, 1, 20.0)
 
@@ -109,7 +115,7 @@ def test_span_size_mismatch(span_setup):
     transfers = [
         PoolTransfer(name=PoolName.KV, host_indices=torch.arange(4), keys=["h0"])
     ]
-    assert backend.batch_set_v2(transfers)["KV"] == [False]
+    assert backend.batch_set_v2(transfers)[PoolName.KV] == [False]
 
 
 def test_batch_exists_v2_prefix(span_setup):
@@ -117,11 +123,15 @@ def test_batch_exists_v2_prefix(span_setup):
     keys = ["h0", "h1"]
     host_indices = torch.cat([_key_slots(0), _key_slots(1)])
     transfers = [PoolTransfer(name=PoolName.KV, host_indices=host_indices, keys=keys)]
-    assert backend.batch_set_v2(transfers)["KV"] == [True, True]
+    assert backend.batch_set_v2(transfers)[PoolName.KV] == [True, True]
     assert backend.batch_exists_v2(keys, transfers).kv_hit_pages == 2
     assert backend.batch_exists_v2(["h0", "missing"], transfers).kv_hit_pages == 1
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="HiCache native hash requires little-endian Linux",
+)
 def test_hash_chain_alignment():
     tokens = list(range(512))
     hashes = get_hash_str(tokens, None, page_size=256)
