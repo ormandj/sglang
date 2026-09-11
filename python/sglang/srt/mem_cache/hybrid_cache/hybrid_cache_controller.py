@@ -711,7 +711,7 @@ class HybridCacheController(BaseHiCacheController):
                         sidecar_ok = False
                         break
             operation.completed_tokens = (
-                len(operation.hash_value) * self.page_size if sidecar_ok else 0
+                len(operation.hash_value) * self.storage_page_size if sidecar_ok else 0
             )
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
