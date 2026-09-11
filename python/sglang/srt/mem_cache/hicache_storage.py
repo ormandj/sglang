@@ -38,6 +38,10 @@ class HiCacheStorageConfig:
     tp_lcm_size: Optional[int] = None
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
+    # Token granularity of one storage key; 0 means "same as the host pool
+    # page size". Set to the radix-tree page size for compressed-DSA span
+    # mode, where one stored object holds multiple consecutive host pages.
+    storage_page_size: int = 0
 
 
 @dataclass
@@ -164,6 +168,10 @@ class HiCacheStorage(ABC):
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
+
+    # Whether the backend can store one key as multiple consecutive host
+    # pages (compressed-DSA span mode).
+    supports_page_spans: bool = False
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
@@ -371,6 +379,8 @@ class MetadataCache:
 
 
 class HiCacheFile(HiCacheStorage):
+    supports_page_spans = True
+
     def __init__(
         self, storage_config: HiCacheStorageConfig, file_path: str = "/tmp/hicache"
     ):
@@ -386,6 +396,7 @@ class HiCacheFile(HiCacheStorage):
         )
         attn_cp_rank = storage_config.attn_cp_rank
         attn_cp_size = storage_config.attn_cp_size
+        self.storage_page_size = storage_config.storage_page_size or 0
         model_name = "-".join(model_name.split("/")) if model_name else ""
         enable_pp = pp_size > 1
         self.config_suffix = f"_{model_name}"
@@ -663,45 +674,81 @@ class HiCacheFile(HiCacheStorage):
     def _log_key(self, pool_name: str, key: str) -> str:
         return key if pool_name == PoolName.KV else f"{key}.{pool_name}"
 
-    def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
-        """Read one page from storage into host_pool at page_offset."""
+    def _read_span(
+        self, pool_name: str, key: str, host_pool, slots: torch.Tensor, pool_page: int
+    ) -> bool:
+        """Read one storage object (one key) into host_pool pages."""
         storage_key = self._log_key(pool_name, key)
-        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
+        first_slots = [int(s) for s in slots[::pool_page]]
+        dummy_page = host_pool.get_dummy_flat_data_page()
+        target = (
+            dummy_page
+            if len(first_slots) == 1
+            else torch.cat([host_pool.get_dummy_flat_data_page() for _ in first_slots])
+        )
+        data_page = self.get(storage_key, target)
         if data_page is None:
             return False
-        host_pool.set_from_flat_data_page(page_offset, data_page)
+        page_numel = dummy_page.numel()
+        for j, first_slot in enumerate(first_slots):
+            host_pool.set_from_flat_data_page(
+                first_slot, data_page[j * page_numel : (j + 1) * page_numel]
+            )
         return True
 
-    def _write_page(
-        self, pool_name: str, key: str, host_pool, page_offset: int
+    def _write_span(
+        self, pool_name: str, key: str, host_pool, slots: torch.Tensor, pool_page: int
     ) -> bool:
-        """Write one page from host_pool at page_offset to storage as raw bytes."""
+        """Write one storage object (one key) from host_pool pages."""
         storage_key = self._log_key(pool_name, key)
-        data_page = host_pool.get_data_page(page_offset, flat=True)
-        return self.set(storage_key, data_page)
+        first_slots = [int(s) for s in slots[::pool_page]]
+        pages = [host_pool.get_data_page(s, flat=True) for s in first_slots]
+        data = pages[0] if len(pages) == 1 else torch.cat(pages)
+        return self.set(storage_key, data)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
         results: dict[str, List[bool]] = {}
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
             keys = transfer.keys or []
-            page_size = getattr(host_pool, "page_size", 1) or 1
-            expected = len(keys) * page_size
+            pool_page = getattr(host_pool, "page_size", 1) or 1
+            # Span mode: KV and KV-derived pools carry storage_page_size token
+            # slots per key (multiple consecutive host pages). Independent
+            # state pools (e.g. mamba) carry their own per-key entry count —
+            # one checkpoint slot per tree page — so the stride is derived
+            # from the transfer instead of assumed.
+            span = self.storage_page_size or pool_page
             host_indices = transfer.host_indices
-
-            if host_indices is None or host_indices.numel() != expected:
+            kv_derived = (
+                transfer.name == PoolName.KV
+                or transfer.indices_from_pool == PoolName.KV
+            )
+            per_key = None
+            if host_indices is not None and keys:
+                per_key = host_indices.numel() // len(keys)
+                if per_key < 1 or host_indices.numel() != per_key * len(keys) or (
+                    kv_derived and per_key != span
+                ):
+                    per_key = None
+            if per_key is None:
                 logger.error(
-                    "%s indices length mismatch for %s: expected %s, got %s",
+                    "%s indices length mismatch for %s: expected %s per key, got %s",
                     op_fn.__name__,
                     transfer.name,
-                    expected,
+                    span if kv_derived else "len(keys)-divisible",
                     host_indices.numel() if host_indices is not None else 0,
                 )
                 results[transfer.name] = [False] * len(keys)
                 continue
 
             results[transfer.name] = [
-                op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item())
+                op_fn(
+                    transfer.name,
+                    key,
+                    host_pool,
+                    host_indices[i * per_key : (i + 1) * per_key],
+                    pool_page,
+                )
                 for i, key in enumerate(keys)
             ]
         return results
@@ -711,14 +758,14 @@ class HiCacheFile(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
-        return self._batch_io_v2(transfers, self._read_page)
+        return self._batch_io_v2(transfers, self._read_span)
 
     def batch_set_v2(
         self,
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
-        return self._batch_io_v2(transfers, self._write_page)
+        return self._batch_io_v2(transfers, self._write_span)
 
     def clear(self) -> bool:
         try:

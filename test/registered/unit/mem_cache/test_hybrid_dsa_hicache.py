@@ -158,10 +158,20 @@ class TestCompressedIndexOwnership(unittest.TestCase):
         cache = UnifiedRadixCache(cache_params(dsa_pool()))
         cache.cache_controller = SimpleNamespace(page_size=64)
         cache._storage_attachment = MagicMock()
-        success, message = cache.attach_storage_backend("file")
+        success, message = cache.attach_storage_backend("sim")
         self.assertFalse(success)
         self.assertIn("L2 HiCache only", message)
         cache._storage_attachment.attach.assert_not_called()
+
+    def test_runtime_storage_attach_accepts_span_capable_backend(self):
+        cache = UnifiedRadixCache(cache_params(dsa_pool()))
+        cache.cache_controller = SimpleNamespace(page_size=64)
+        cache._storage_attachment = MagicMock()
+        cache._storage_attachment.attach.return_value = (True, "ok")
+        success, _ = cache.attach_storage_backend("file")
+        self.assertTrue(success)
+        self.assertEqual(cache.cache_controller.storage_page_size, 256)
+        cache._storage_attachment.attach.assert_called_once()
 
     def test_external_linker_rejects_different_hash_page_size(self):
         cache = UnifiedRadixCache(cache_params(dsa_pool()))
@@ -175,12 +185,41 @@ class TestCompressedIndexOwnership(unittest.TestCase):
             patch(
                 "sglang.srt.mem_cache.unified_radix_cache.get_memory",
                 return_value=SimpleNamespace(
-                    hicache_host_memory_mode="cache", hicache_storage_backend="file"
+                    hicache_host_memory_mode="cache", hicache_storage_backend="sim"
                 ),
             ),
             self.assertRaisesRegex(ValueError, "L2 HiCache only"),
         ):
             cache.init_hicache(ServerArgs(model_path="dummy"), params)
+
+    def test_startup_storage_accepts_span_capable_backend(self):
+        params = cache_params(dsa_pool())
+        cache = UnifiedRadixCache(params)
+        cache.cache_controller = SimpleNamespace(
+            enable_storage=False,
+            write_policy="write_through_selective",
+            storage_backend=None,
+        )
+        with (
+            patch(
+                "sglang.srt.mem_cache.unified_radix_cache.get_memory",
+                return_value=SimpleNamespace(
+                    hicache_host_memory_mode="cache",
+                    hicache_storage_backend="file",
+                    hicache_storage_backend_extra_config=None,
+                    hicache_write_policy="write_through",
+                    hicache_storage_prefetch_policy="default",
+                ),
+            ),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.attach_hybrid_pool_to_unified_cache"
+            ) as attach,
+            patch("sglang.srt.mem_cache.unified_radix_cache.StorageAttachment"),
+        ):
+            cache.init_hicache(ServerArgs(model_path="dummy"), params)
+        attach.assert_called_once()
+        self.assertEqual(cache.cache_controller.storage_page_size, 256)
+        self.assertIsNone(cache.cache_controller.storage_backend)
 
 
 class TestHybridIndexSidecar(unittest.TestCase):

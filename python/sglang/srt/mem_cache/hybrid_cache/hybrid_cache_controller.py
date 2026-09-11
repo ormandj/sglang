@@ -577,7 +577,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         hash_value = self.get_hash_str(
-            operation.token_ids, operation.last_hash, page_size=self.page_size
+            operation.token_ids, operation.last_hash, page_size=self.storage_page_size
         )
         operation.all_hash_values = hash_value
 
@@ -599,7 +599,7 @@ class HybridCacheController(BaseHiCacheController):
 
         return (
             hash_value[:kv_hit_pages],
-            kv_hit_pages * self.page_size,
+            kv_hit_pages * self.storage_page_size,
         )
 
     def move_hybrid_indices(
@@ -711,7 +711,7 @@ class HybridCacheController(BaseHiCacheController):
                         sidecar_ok = False
                         break
             operation.completed_tokens = (
-                len(operation.hash_value) * self.page_size if sidecar_ok else 0
+                len(operation.hash_value) * self.storage_page_size if sidecar_ok else 0
             )
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
