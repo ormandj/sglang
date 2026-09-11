@@ -12,6 +12,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -22,6 +24,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+    HybridCacheController,
+)
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.storage.backend_factory import StorageBackendFactory
 from sglang.srt.mem_cache.utils import get_hash_str
 
@@ -197,3 +203,128 @@ def test_mixed_kv_and_state_pool_roundtrip(span_setup):
 def test_backend_supports_page_spans():
     assert StorageBackendFactory.backend_supports_page_spans("file") is True
     assert StorageBackendFactory.backend_supports_page_spans("nonexistent") is False
+
+
+def _controller_storage_config(storage_page_size: int) -> HiCacheStorageConfig:
+    """Run the controller's real config-generation path.
+
+    The shell is built the same way test_hybrid_dsa_hicache.py builds
+    controllers (object.__new__ + parallel getters patched); only the
+    parallel-state globals are stubbed, every config field is produced by
+    HiCacheController._generate_storage_config itself.
+    """
+    from sglang.srt.managers import cache_controller as cc_module
+
+    controller = object.__new__(cc_module.HiCacheController)
+    controller.storage_page_size = storage_page_size
+    controller.enable_storage_metrics = False
+    controller.mem_pool_host = SimpleNamespace(layout="layer_first")
+    controller.mem_pool_device = object.__new__(MLATokenToKVPool)
+    controller.get_attn_cp_rank_and_size = lambda: (0, 1)
+
+    parallel = SimpleNamespace(
+        tp_rank=0, tp_size=1, pp_rank=0, pp_size=1, attn_tp_rank=0, attn_tp_size=1
+    )
+    with (
+        patch.object(cc_module, "is_dp_attention_enabled", return_value=False),
+        patch.object(cc_module, "get_parallel", lambda: parallel),
+        patch.object(cc_module, "get_attention_dp_rank", lambda: 0),
+    ):
+        config = controller._generate_storage_config(model_name="span-ctl-test")
+    assert config.storage_page_size == storage_page_size
+    return config
+
+
+@pytest.mark.parametrize(
+    "storage_page_size,pages_per_key",
+    [(4, 1), (16, 4)],  # degenerate non-span page, inflated span page
+)
+def test_mixed_kv_mamba_roundtrip_controller_config(
+    tmp_path, storage_page_size, pages_per_key
+):
+    """Mixed KV + Mamba roundtrip under the controller-generated config, both
+    for the degenerate (storage_page_size == page_size) and the span
+    (storage_page_size == 4 * page_size) wiring.
+
+    Regression for the review finding: a uniform stride expected Mamba to
+    carry storage_page_size slots per key, rejecting its one-checkpoint-slot
+    transfers in span mode *and* in ordinary non-span hybrid file storage.
+    """
+    config = _controller_storage_config(storage_page_size)
+    backend = HiCacheFile(
+        config, file_path=str(tmp_path / f"hicache-{storage_page_size}")
+    )
+    kv_pool = FakeSpanHostPool(num_pages=8)
+    state_pool = FakeStatePool(num_slots=8)
+    backend.register_mem_host_pool_v2(kv_pool, PoolName.KV)
+    backend.register_mem_host_pool_v2(state_pool, PoolName.MAMBA)
+
+    keys = ["h0", "h1"]
+    kv_indices = torch.arange(2 * storage_page_size)
+    state_indices = torch.tensor([3, 5])
+    transfers = [
+        PoolTransfer(name=PoolName.KV, host_indices=kv_indices, keys=keys),
+        PoolTransfer(name=PoolName.MAMBA, host_indices=state_indices, keys=keys),
+    ]
+
+    for k in range(2):
+        for j in range(pages_per_key):
+            slot = k * storage_page_size + j * PAGE_SIZE
+            kv_pool.kv_buffer[:, slot : slot + PAGE_SIZE, :, :] = 10.0 * (k + 1) + j
+    state_pool.states[3] = 111.0
+    state_pool.states[5] = 222.0
+
+    res = backend.batch_set_v2(transfers)
+    assert all(res[PoolName.KV]) and all(res[PoolName.MAMBA])
+
+    kv_pool.kv_buffer.zero_()
+    state_pool.states.zero_()
+    res = backend.batch_get_v2(transfers)
+    assert all(res[PoolName.KV]) and all(res[PoolName.MAMBA])
+    for k in range(2):
+        for j in range(pages_per_key):
+            slot = k * storage_page_size + j * PAGE_SIZE
+            assert torch.all(
+                kv_pool.kv_buffer[:, slot : slot + PAGE_SIZE, :, :]
+                == 10.0 * (k + 1) + j
+            )
+    assert torch.all(state_pool.states[3] == 111.0)
+    assert torch.all(state_pool.states[5] == 222.0)
+
+
+@pytest.mark.parametrize("all_sidecars_ok", [True, False])
+def test_backup_skip_completed_tokens_uses_storage_page(all_sidecars_ok):
+    """backup_skip accounting must count one storage page per hash key.
+
+    With span mode a single key covers storage_page_size tokens (e.g. 256),
+    not page_size (64); the sidecar-ok and sidecar-failed branches must both
+    report against the storage page so backup-token metrics agree across
+    ranks.
+    """
+    controller = object.__new__(HybridCacheController)
+    controller.backup_skip = True
+    controller.page_size = PAGE_SIZE
+    controller.storage_page_size = STORAGE_PAGE_SIZE
+    controller.storage_backend_type = "file"
+    controller.mem_pool_host = MagicMock()
+    controller.storage_backend = MagicMock()
+    results = {PoolName.MAMBA: [True, True] if all_sidecars_ok else [True, False]}
+    controller.storage_backend.batch_set_v2 = MagicMock(return_value=results)
+
+    operation = SimpleNamespace(
+        pool_transfers=[
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                host_indices=torch.tensor([3, 5]),
+                keys=["h0", "h1"],
+            )
+        ],
+        hash_value=["h0", "h1"],
+        completed_tokens=0,
+        pool_storage_result=MagicMock(),
+        host_indices=None,
+    )
+    controller._page_backup(operation)
+
+    expected = len(operation.hash_value) * STORAGE_PAGE_SIZE if all_sidecars_ok else 0
+    assert operation.completed_tokens == expected
