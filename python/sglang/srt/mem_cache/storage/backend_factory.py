@@ -41,6 +41,21 @@ class StorageBackendFactory:
             ) from e
 
     @classmethod
+    def backend_supports_page_spans(cls, backend_name: str) -> bool:
+        entry = cls._registry.get(backend_name)
+        if entry is None:
+            return False
+        try:
+            backend_class = entry["loader"]()
+        except Exception:
+            logger.exception(
+                "Failed to load storage backend '%s' for span capability check",
+                backend_name,
+            )
+            return False
+        return bool(getattr(backend_class, "supports_page_spans", False))
+
+    @classmethod
     def register_backend(cls, name: str, module_path: str, class_name: str) -> None:
         """Register a storage backend with lazy loading.
 
