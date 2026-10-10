@@ -325,8 +325,9 @@ class TestFlashInferSparseMLARunnerCapacity(unittest.TestCase):
         )
 
         class Request(SimpleNamespace):
-            def set_extend_range(self, start, end):
-                self.extend_range = SimpleNamespace(length=end - start)
+            @property
+            def extend_len(self):
+                return self.extend_end - self.prefix_len
 
         for length, result in (
             (8192, AddReqResult.CONTINUE),
@@ -336,13 +337,14 @@ class TestFlashInferSparseMLARunnerCapacity(unittest.TestCase):
                 full_untruncated_fill_ids=range(length),
                 origin_input_ids=range(length),
                 prefix_indices=[],
+                prefix_len=0,
                 output_ids=[],
                 sampling_params=SimpleNamespace(ignore_eos=True, max_new_tokens=8),
                 retracted_stain=False,
             )
             self.assertIs(adder.add_one_req(req, False, None), result)
         self.assertEqual(len(adder.can_run_list), 2)
-        admitted = sum(req.extend_range.length for req in adder.can_run_list)
+        admitted = sum(req.extend_len for req in adder.can_run_list)
         self.assertEqual(admitted, 38192)
         capacity = _flashinfer_sparse_mla_max_tokens(
             chunked_prefill_size=None,
